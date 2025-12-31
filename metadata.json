@@ -1,0 +1,8 @@
+{
+  "name": "SeedCore Hotel Simulator",
+  "description": "A futuristic hotel simulation driven by the SeedCore cognitive operating system, featuring autonomous agents, IoT infrastructure, and a multi-plane neuro-symbolic architecture.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
