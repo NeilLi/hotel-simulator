@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState, useMemo } from "react";
 import { getTheme, getCoordinates } from "../utils/svgHotelMap";
 import type { Room, Agent } from "../types";
+import { eventEmitter } from "../services/eventEmitter";
 
 // --- HOLOGRAPHIC STYLES ---
 const GLOBAL_STYLES = `
@@ -72,6 +73,41 @@ export function SvgHotelBackdrop({
   // Defensive copies
   const safeRooms = Array.isArray(rooms) ? rooms : [];
   const safeAgents = Array.isArray(agents) ? agents : [];
+  
+  // Track which room is currently hovered to avoid duplicate events
+  const [hoveredRoomId, setHoveredRoomId] = useState<string | null>(null);
+  
+  // Helper function to calculate occupancy (count agents in a room)
+  const calculateRoomOccupancy = (room: Room): number => {
+    if (!room.topLeft || !room.bottomRight) return 0;
+    
+    return safeAgents.filter(agent => {
+      const pos = agent.position;
+      return pos.x >= room.topLeft.x && 
+             pos.x <= room.bottomRight.x &&
+             pos.y >= room.topLeft.y && 
+             pos.y <= room.bottomRight.y;
+    }).length;
+  };
+  
+  // Handle room hover to emit occupancy event
+  const handleRoomMouseEnter = (room: Room) => {
+    if (hoveredRoomId === room.id) return; // Already hovering this room
+    
+    setHoveredRoomId(room.id);
+    const occupancy = calculateRoomOccupancy(room);
+    
+    // Emit room occupancy changed event
+    eventEmitter.emitRoomOccupancyChanged({
+      roomId: room.id,
+      roomName: room.name,
+      occupancy: occupancy,
+    });
+  };
+  
+  const handleRoomMouseLeave = () => {
+    setHoveredRoomId(null);
+  };
 
   return (
     <div ref={containerRef} className="absolute inset-0 bg-[#020617] select-none holo-container">
@@ -140,10 +176,28 @@ export function SvgHotelBackdrop({
           {/* LAYER 2: ROOM FOOTPRINTS (Glass Panels) */}
           {safeRooms.map(room => {
              const { x, y, w, h } = getCoordinates(room);
+             const isHovered = hoveredRoomId === room.id;
+             const occupancy = calculateRoomOccupancy(room);
+             
              return (
-               <g key={room.id} opacity="0.8">
-                  {/* Floor Plate */}
-                  <rect x={x} y={y} width={w} height={h} fill={theme.roomFill} stroke="none" />
+               <g 
+                 key={room.id} 
+                 opacity={isHovered ? "1.0" : "0.8"}
+                 onMouseEnter={() => handleRoomMouseEnter(room)}
+                 onMouseLeave={handleRoomMouseLeave}
+                 style={{ cursor: 'pointer' }}
+               >
+                  {/* Floor Plate - Interactive area */}
+                  <rect 
+                    x={x} 
+                    y={y} 
+                    width={w} 
+                    height={h} 
+                    fill={theme.roomFill} 
+                    stroke={isHovered ? theme.roomBorder : "none"} 
+                    strokeWidth={isHovered ? "0.2" : "0"}
+                    style={{ transition: 'all 0.2s ease' }}
+                  />
                   {/* Back Wall (Illusion of 3D) */}
                   <rect x={x} y={y} width={w} height={0.5} fill="url(#wall-grad)" />
                   {/* Corners */}
@@ -153,17 +207,33 @@ export function SvgHotelBackdrop({
                   />
                   {/* Label */}
                   <text 
-                     x={x + w/2} y={y + h/2} 
+                     x={x + w/2} 
+                     y={y + h/2} 
                      fill={theme.text} 
                      fontSize="0.7" 
                      textAnchor="middle" 
                      dominantBaseline="middle"
                      fontFamily="monospace"
-                     opacity="0.6"
+                     opacity={isHovered ? "0.9" : "0.6"}
                      style={{ textShadow: `0 0 4px ${theme.bg}` }}
                   >
                      {room.name.toUpperCase()}
                   </text>
+                  {/* Occupancy indicator when hovered */}
+                  {isHovered && (
+                    <text 
+                      x={x + w/2} 
+                      y={y + h/2 + 1.2} 
+                      fill={theme.textHighlight} 
+                      fontSize="0.5" 
+                      textAnchor="middle" 
+                      dominantBaseline="middle"
+                      fontFamily="monospace"
+                      opacity="0.8"
+                    >
+                      {occupancy} {occupancy === 1 ? 'agent' : 'agents'}
+                    </text>
+                  )}
                </g>
              );
           })}

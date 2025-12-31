@@ -7,6 +7,8 @@ import { GRID_WIDTH, GRID_HEIGHT, TICK_RATE_MS } from './constants';
 import { SvgHotelBackdrop } from './components/SvgHotelBackdrop';
 import { VirtualLobby } from './components/VirtualLobby';
 import { ConciergePanel } from './components/ConciergePanel';
+import { useEventTracking } from './hooks/useEventTracking';
+import { kafkaPublisher } from './services/kafkaPublisher';
 
 // --- SIDEBAR COMPONENT: SENSORY TELEMETRY (LEFT) ---
 const SensoryTelemetryPanel = ({ active }: { active: boolean }) => {
@@ -74,6 +76,14 @@ const App: React.FC = () => {
     logs: [],
     timeOfDay: 8.0 
   });
+
+  // Initialize event tracking (connects eventEmitter to kafkaPublisher)
+  useEventTracking();
+
+  // Update kafkaPublisher AI state when it changes
+  useEffect(() => {
+    kafkaPublisher.setAiEnabled(isAiEnabled);
+  }, [isAiEnabled]);
 
   useEffect(() => {
     const { grid: g, rooms: r } = generateMap(GRID_WIDTH, GRID_HEIGHT);
