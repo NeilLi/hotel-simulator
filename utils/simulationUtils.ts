@@ -2,7 +2,6 @@
 import { Room, Agent, AgentRole, EntityType, Coordinates, SeedCoreState } from "../types";
 import { GRID_WIDTH, GRID_HEIGHT } from "../constants";
 import { geminiService } from "../services/geminiService";
-import { elevenLabsService } from "../services/elevenServices";
 
 // --- GLOBAL LAYOUT CONSTANTS (Shared for generation and logic) ---
 const ATRIUM_W = 20;
@@ -155,13 +154,34 @@ let currentConversingAgentId: string | null = null;
 let dialogueGenerationQueue: Array<() => Promise<void>> = [];
 let isProcessingDialogue = false;
 
-// Voice IDs for different agent roles
-const VOICE_IDS = {
-  [AgentRole.GUEST]: '21m00Tcm4TlvDq8ikWAM', // Rachel - warm, human
-  [AgentRole.ROBOT_WAITER]: 'EXAVITQu4vr4xnSDxMaL', // Bella - professional, friendly
-  [AgentRole.ROBOT_CONCIERGE]: 'VR6AewLTigWG4xSOukaG', // Arnold - authoritative, helpful
-  [AgentRole.ROBOT_GARDENER]: 'ThT5KcBeYPX3keUQqHPh', // Dorothy - calm, gentle
-  [AgentRole.STAFF_HUMAN]: '21m00Tcm4TlvDq8ikWAM', // Rachel
+// Google Cloud TTS Voice configurations for different agent roles
+// Voice names from Google Cloud TTS (en-US voices)
+const VOICE_CONFIGS = {
+  [AgentRole.GUEST]: { 
+    name: 'en-US-Neural2-D', // Warm, natural male voice
+    ssmlGender: 'MALE' as const,
+    languageCode: 'en-US'
+  },
+  [AgentRole.ROBOT_WAITER]: { 
+    name: 'en-US-Neural2-F', // Professional, friendly female voice
+    ssmlGender: 'FEMALE' as const,
+    languageCode: 'en-US'
+  },
+  [AgentRole.ROBOT_CONCIERGE]: { 
+    name: 'en-US-Neural2-C', // Authoritative, helpful male voice
+    ssmlGender: 'MALE' as const,
+    languageCode: 'en-US'
+  },
+  [AgentRole.ROBOT_GARDENER]: { 
+    name: 'en-US-Neural2-E', // Calm, gentle female voice
+    ssmlGender: 'FEMALE' as const,
+    languageCode: 'en-US'
+  },
+  [AgentRole.STAFF_HUMAN]: { 
+    name: 'en-US-Neural2-D',
+    ssmlGender: 'MALE' as const,
+    languageCode: 'en-US'
+  },
 };
 
 /**
@@ -249,27 +269,80 @@ Generate ONE complete, natural sentence (15-25 words) that this ${roleName} woul
 }
 
 /**
- * Convert dialogue to speech using ElevenLabs
+ * Convert dialogue to speech using Google Cloud Text-to-Speech API
  */
 async function convertDialogueToSpeech(
   dialogue: string,
   agentRole: AgentRole
 ): Promise<string | null> {
   try {
-    const voiceId = VOICE_IDS[agentRole] || VOICE_IDS[AgentRole.GUEST];
-    
-    // Adjust voice settings based on role
-    const voiceSettings = agentRole === AgentRole.ROBOT_WAITER || agentRole === AgentRole.ROBOT_CONCIERGE
-      ? { stability: 0.5, similarity_boost: 0.8 } // More consistent for robots
-      : { stability: 0.35, similarity_boost: 0.75 }; // More natural for guests
-
-    const result = await elevenLabsService.textToSpeech(dialogue, voiceId, voiceSettings);
-    
-    if (result.audioUrl && !result.error) {
-      return result.audioUrl;
+    const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY || process.env.VITE_GEMINI_API_KEY;
+    if (!apiKey) {
+      console.warn('[simulationUtils] No API key available for TTS (using GEMINI_API_KEY)');
+      return null;
     }
+
+    const voiceConfig = VOICE_CONFIGS[agentRole] || VOICE_CONFIGS[AgentRole.GUEST];
     
-    return null;
+    // Adjust speaking rate and pitch based on role
+    const speakingRate = agentRole === AgentRole.ROBOT_WAITER || agentRole === AgentRole.ROBOT_CONCIERGE
+      ? 1.0 // Normal rate for robots
+      : 0.95; // Slightly slower for guests (more natural)
+    
+    const pitch = agentRole === AgentRole.ROBOT_CONCIERGE
+      ? 0.5 // Slightly lower pitch for authority
+      : 0.0; // Normal pitch
+
+    // Use Google Cloud Text-to-Speech API
+    const response = await fetch(
+      `https://texttospeech.googleapis.com/v1/text:synthesize?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          input: { text: dialogue },
+          voice: {
+            languageCode: voiceConfig.languageCode,
+            name: voiceConfig.name,
+            ssmlGender: voiceConfig.ssmlGender,
+          },
+          audioConfig: {
+            audioEncoding: 'MP3',
+            speakingRate: speakingRate,
+            pitch: pitch,
+            volumeGainDb: 0.0,
+          },
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('[simulationUtils] Google Cloud TTS API error:', errorText);
+      
+      if (response.status === 401 || response.status === 403) {
+        console.warn('[simulationUtils] TTS API key invalid or Text-to-Speech API not enabled');
+        return null;
+      }
+      
+      return null;
+    }
+
+    const data = await response.json();
+    
+    if (!data.audioContent) {
+      console.error('[simulationUtils] No audio content in TTS response');
+      return null;
+    }
+
+    // Convert base64 audio content to blob URL
+    const audioBytes = Uint8Array.from(atob(data.audioContent), c => c.charCodeAt(0));
+    const blob = new Blob([audioBytes], { type: 'audio/mp3' });
+    const audioUrl = URL.createObjectURL(blob);
+
+    return audioUrl;
   } catch (error) {
     console.error(`[simulationUtils] Failed to convert dialogue to speech:`, error);
     return null;
