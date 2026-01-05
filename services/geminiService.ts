@@ -1,5 +1,7 @@
+
 import { GoogleGenAI, FunctionDeclaration, Type } from "@google/genai";
 import { SeedCoreState } from "../types";
+import { assetStore } from "./assetStore";
 
 const SYSTEM_INSTRUCTION = `
 Project: Living AI Hotel — Human & Robotic Coexistence
@@ -71,7 +73,7 @@ class GeminiService {
   private fastModel = "gemini-3-flash-preview"; 
   
   // --- Cost Control & Optimization State ---
-  private lobbyImageCache = new Map<string, string>();
+  private lobbyImageCache = new Map<string, string>(); // Level 1 Memory Cache
   private lastImageGenTime = 0;      // Throttle image generation
   private readonly VIDEO_QUOTA_KEY = 'SEEDCORE_VIDEO_QUOTA_USED';
 
@@ -80,7 +82,8 @@ class GeminiService {
     if (typeof window !== 'undefined') {
       (window as any).resetSeedCoreLimits = () => {
         localStorage.removeItem(this.VIDEO_QUOTA_KEY);
-        console.log("✅ SeedCore Limits Reset: You can generate 1 more video.");
+        assetStore.clear(); // Add ability to clear image cache
+        console.log("✅ SeedCore Limits Reset: Video quota cleared & Image Cache purged.");
       };
     }
   }
@@ -218,10 +221,18 @@ class GeminiService {
   }
 
   async generateLobbyImage(atmosphere: string): Promise<string | null> {
-    // OPTIMIZATION: Check cache first
+    // LEVEL 1: CHECK MEMORY CACHE
     if (this.lobbyImageCache.has(atmosphere)) {
-      console.log(`[GeminiService] Serving cached image for ${atmosphere}`);
+      console.log(`[GeminiService] L1 Memory Hit: ${atmosphere}`);
       return this.lobbyImageCache.get(atmosphere)!;
+    }
+
+    // LEVEL 2: CHECK PERSISTENT ASSET STORE (IndexedDB)
+    const storedAsset = await assetStore.get(atmosphere);
+    if (storedAsset) {
+        console.log(`[GeminiService] L2 AssetStore Hit: ${atmosphere}`);
+        this.lobbyImageCache.set(atmosphere, storedAsset); // Hydrate L1
+        return storedAsset;
     }
 
     // OPTIMIZATION: Throttle requests (10s cooldown)
@@ -257,14 +268,18 @@ class GeminiService {
         }
       });
       
-      // Fix: Correctly iterate through response parts to find image data in inlineData
-      // Use optional chaining for safety if candidates is undefined or empty
       if (response && response.candidates && response.candidates.length > 0 && response.candidates[0].content?.parts) {
         for (const part of response.candidates[0].content.parts) {
           if (part.inlineData && part.inlineData.data) {
              const imgData = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
-             // OPTIMIZATION: Update cache
+             
+             // SAVE TO L1 CACHE (Memory)
              this.lobbyImageCache.set(atmosphere, imgData);
+             
+             // SAVE TO L2 CACHE (Persistent Asset Store)
+             assetStore.save(atmosphere, imgData)
+                .catch(err => console.warn("Background Save Failed:", err));
+             
              return imgData;
           }
         }

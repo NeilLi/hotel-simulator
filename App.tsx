@@ -1,10 +1,10 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Aperture, Map, Film, X, Activity, Clock, Power, Cpu, AlertTriangle, Layers, Terminal, Loader2 } from 'lucide-react';
+import { Aperture, Map, Film, X, Activity, Clock, Power, Cpu, AlertTriangle, Layers, Terminal, Loader2, Thermometer, Wind, Lightbulb, Droplets } from 'lucide-react';
 import { geminiService } from './services/geminiService';
 import { generateMap, generateAgents, updateAgentsLogic } from './utils/simulationUtils';
 import { EntityType, Room, Agent, SeedCoreState, SeedCorePlane } from './types';
 import { GRID_WIDTH, GRID_HEIGHT, TICK_RATE_MS } from './constants';
-import { SvgHotelBackdrop } from './components/SvgHotelBackdrop';
+import { DirectorMapLayer } from './components/DirectorMapLayer'; // Updated Import
 import { VirtualLobby } from './components/VirtualLobby';
 import { ConciergePanel } from './components/ConciergePanel';
 
@@ -115,6 +115,18 @@ const App: React.FC = () => {
     setIsVideoLoading(false);
   };
 
+  const getLightingStatus = (atmosphere: string) => {
+    switch (atmosphere) {
+        case 'MORNING_LIGHT': return { text: "Natural 85%", color: "text-amber-200" };
+        case 'GOLDEN_HOUR': return { text: "Warm 60%", color: "text-orange-300" };
+        case 'EVENING_CHIC': return { text: "Dimmed 40%", color: "text-indigo-300" };
+        case 'MIDNIGHT_LOUNGE': return { text: "Deep 20%", color: "text-violet-400" };
+        default: return { text: "Standard", color: "text-cyan-200" };
+    }
+  };
+
+  const lighting = getLightingStatus(coreState.activeAtmosphere);
+
   return (
     <div className="relative w-screen h-screen bg-[#020617] overflow-hidden text-slate-200 font-system selection:bg-cyan-500/20">
       
@@ -134,19 +146,16 @@ const App: React.FC = () => {
         </div>
       ) : (
         /* --- DIRECTOR MAP INTERFACE --- */
-        /* Replaced CSS opacity transition with conditional rendering to fix black screen bug */
         <div className="w-full h-full relative flex flex-col animate-in fade-in zoom-in-95 duration-1000">
           
-          {/* SVG VISUALIZATION BACKDROP */}
+          {/* DYNAMIC WEBGL MAP BACKDROP (Replaces SVG) */}
           {isInitialized && (
             <div className="absolute inset-0 z-0">
-               <SvgHotelBackdrop 
-                  atmosphere={coreState.activeAtmosphere}
-                  enabled={true}
+               <DirectorMapLayer 
                   rooms={rooms}
                   agents={agents}
-                  gridW={GRID_WIDTH}
-                  gridH={GRID_HEIGHT}
+                  selectedRoomId={selectedRoom?.id}
+                  onRoomSelect={setSelectedRoom}
                />
             </div>
           )}
@@ -186,33 +195,78 @@ const App: React.FC = () => {
           {/* HUD SIDEBARS */}
           <SensoryTelemetryPanel active={isAiEnabled} />
           
-          {/* REPLACED OPERATIONS PANEL WITH CONCIERGE PANEL */}
           <ConciergePanel active={isAiEnabled} />
 
           {/* FOOTER INSPECTOR */}
           {selectedRoom && (
-             <div className="absolute bottom-12 left-1/2 -translate-x-1/2 w-[400px] bg-slate-950/60 backdrop-blur-2xl border border-cyan-500/30 p-6 rounded-2xl shadow-[0_0_60px_rgba(0,0,0,0.8)] z-40 animate-in slide-in-from-bottom-8 duration-500">
-                <div className="flex justify-between items-center mb-5">
+             <div className="absolute bottom-12 left-1/2 -translate-x-1/2 w-[480px] bg-slate-950/80 backdrop-blur-2xl border border-cyan-500/30 p-6 rounded-2xl shadow-[0_0_60px_rgba(0,0,0,0.8)] z-40 animate-in slide-in-from-bottom-8 duration-500">
+                <div className="flex justify-between items-center mb-5 border-b border-white/5 pb-4">
                    <div className="flex flex-col">
                      <h3 className="text-sm font-bold uppercase tracking-[0.2em] text-white">{selectedRoom.name}</h3>
-                     <span className="text-[8px] font-mono text-cyan-500/50 uppercase tracking-widest">Room Type: {selectedRoom.type}</span>
+                     <span className="text-[8px] font-mono text-cyan-500/50 uppercase tracking-widest">Type: {selectedRoom.type} • ID: {selectedRoom.id}</span>
                    </div>
                    <button onClick={() => setSelectedRoom(null)} className="p-2 hover:bg-white/10 rounded-full transition-all"><X size={16} className="text-slate-500" /></button>
                 </div>
-                <div className="grid grid-cols-2 gap-6 mb-8">
-                    <div className="p-3 bg-white/5 rounded-lg border border-white/5">
-                        <span className="text-[8px] uppercase font-mono text-slate-500 block mb-1">Status</span>
-                        <span className="text-[10px] font-mono text-emerald-400 uppercase tracking-widest">Operational</span>
+                
+                <div className="grid grid-cols-2 gap-3 mb-6">
+                    {/* Status */}
+                    <div className="p-3 bg-white/5 rounded-lg border border-white/5 flex items-center justify-between">
+                        <div>
+                           <span className="text-[8px] uppercase font-mono text-slate-500 block mb-1">Status</span>
+                           <span className="text-[10px] font-mono text-emerald-400 uppercase tracking-widest">Operational</span>
+                        </div>
+                        <Activity size={14} className="text-emerald-500/50" />
                     </div>
-                    <div className="p-3 bg-white/5 rounded-lg border border-white/5">
-                        <span className="text-[8px] uppercase font-mono text-slate-500 block mb-1">Grid Lock</span>
-                        <span className="text-[10px] font-mono text-cyan-300 uppercase tracking-widest">{selectedRoom.topLeft.x},{selectedRoom.topLeft.y}</span>
+                    {/* Grid Lock */}
+                    <div className="p-3 bg-white/5 rounded-lg border border-white/5 flex items-center justify-between">
+                        <div>
+                           <span className="text-[8px] uppercase font-mono text-slate-500 block mb-1">Grid Lock</span>
+                           <span className="text-[10px] font-mono text-cyan-300 uppercase tracking-widest">{selectedRoom.topLeft.x},{selectedRoom.topLeft.y}</span>
+                        </div>
+                        <Map size={14} className="text-cyan-500/50" />
+                    </div>
+
+                    {/* Temperature */}
+                    <div className="p-3 bg-white/5 rounded-lg border border-white/5 flex items-center justify-between">
+                        <div>
+                            <span className="text-[8px] uppercase font-mono text-slate-500 block mb-1">Temp</span>
+                            <span className="text-[10px] font-mono text-amber-300 uppercase tracking-widest">22.4°C</span>
+                        </div>
+                        <Thermometer size={14} className="text-amber-500/50" />
+                    </div>
+
+                    {/* Air Quality */}
+                    <div className="p-3 bg-white/5 rounded-lg border border-white/5 flex items-center justify-between">
+                        <div>
+                            <span className="text-[8px] uppercase font-mono text-slate-500 block mb-1">Air Quality</span>
+                            <span className="text-[10px] font-mono text-emerald-300 uppercase tracking-widest">AQI 12 (Pure)</span>
+                        </div>
+                        <Wind size={14} className="text-emerald-500/50" />
+                    </div>
+
+                    {/* Lighting */}
+                    <div className="p-3 bg-white/5 rounded-lg border border-white/5 flex items-center justify-between">
+                        <div>
+                            <span className="text-[8px] uppercase font-mono text-slate-500 block mb-1">Lighting</span>
+                            <span className={`text-[10px] font-mono ${lighting.color} uppercase tracking-widest`}>{lighting.text}</span>
+                        </div>
+                        <Lightbulb size={14} className="text-yellow-500/50" />
+                    </div>
+                    
+                    {/* Humidity */}
+                    <div className="p-3 bg-white/5 rounded-lg border border-white/5 flex items-center justify-between">
+                        <div>
+                            <span className="text-[8px] uppercase font-mono text-slate-500 block mb-1">Humidity</span>
+                            <span className="text-[10px] font-mono text-blue-300 uppercase tracking-widest">45%</span>
+                        </div>
+                        <Droplets size={14} className="text-blue-500/50" />
                     </div>
                 </div>
+
                 <button 
                     onClick={() => requestShot(`Holographic verification of ${selectedRoom.name}`)}
                     disabled={!isAiEnabled}
-                    className={`w-full py-4 font-bold uppercase text-[9px] tracking-[0.3em] rounded-xl flex items-center justify-center gap-3 transition-all ${
+                    className={`w-full py-3 font-bold uppercase text-[9px] tracking-[0.3em] rounded-xl flex items-center justify-center gap-3 transition-all ${
                       isAiEnabled ? 'bg-cyan-500 hover:bg-cyan-400 text-black shadow-lg shadow-cyan-500/20' : 'bg-slate-900 text-slate-600 cursor-not-allowed border border-slate-800'
                     }`}
                 >

@@ -8,11 +8,44 @@ import {
   Grid,
   MeshReflectorMaterial,
   MeshTransmissionMaterial,
+  MeshDistortMaterial,
 } from "@react-three/drei";
 import { EffectComposer, Bloom, Noise, Vignette } from "@react-three/postprocessing";
 import * as THREE from "three";
 import type { Room, Agent } from "../types";
 import { GRID_WIDTH, GRID_HEIGHT } from "../constants";
+
+// Fix for missing R3F types in JSX
+declare global {
+  namespace JSX {
+    interface IntrinsicElements {
+      group: any;
+      mesh: any;
+      primitive: any;
+      ambientLight: any;
+      pointLight: any;
+      spotLight: any;
+      hemisphereLight: any;
+      directionalLight: any;
+      fogExp2: any;
+      gridHelper: any;
+      boxGeometry: any;
+      sphereGeometry: any;
+      planeGeometry: any;
+      cylinderGeometry: any;
+      coneGeometry: any;
+      circleGeometry: any;
+      ringGeometry: any;
+      torusGeometry: any;
+      icosahedronGeometry: any;
+      octahedronGeometry: any;
+      meshStandardMaterial: any;
+      meshBasicMaterial: any;
+      meshPhysicalMaterial: any;
+      color: any;
+    }
+  }
+}
 
 // --- CONFIGURATION ---
 const WORLD_SCALE = 0.8;
@@ -315,15 +348,15 @@ function LobbyEnvironment({
 }
 
 // --- 5. AGENT (Enhanced) ---
-function DroneAgent({ 
-  agent, 
-  themeColor,
-  onHover 
-}: { 
+const DroneAgent: React.FC<{ 
   agent: Agent; 
   themeColor: string; 
   onHover?: (id: string | null) => void;
-}) {
+}> = ({ 
+  agent, 
+  themeColor, 
+  onHover 
+}) => {
   if (!agent || !agent.position) return null;
 
   // Sandbox-safe role detection
@@ -332,7 +365,9 @@ function DroneAgent({
   const isWaiter = role.includes("WAITER");
   const isInteracting = agent.state === 'SOCIALIZING';
 
-  const baseColor = isRobot ? themeColor : "#ffffff";
+  // Guest is now a blue "electronic cloud"
+  const guestBlue = "#0ea5e9";
+  const baseColor = isRobot ? themeColor : guestBlue;
   
   // Waiters have a warmer, more welcoming presence (soft amber/white) even in cold themes
   const waiterWarmth = "#ffebd4"; 
@@ -532,7 +567,7 @@ function DroneAgent({
             document.body.style.cursor = 'auto';
         }}
     >
-      <Float speed={isRobot ? 2 : 1} rotationIntensity={0.12} floatIntensity={0.12} scale={sizeScale}>
+      <Float speed={isRobot ? 2 : 1.2} rotationIntensity={isRobot ? 0.12 : 0.5} floatIntensity={0.12} scale={sizeScale}>
         
         {/* === WAITER ROBOT (REFINED & WELCOMING) === */}
         {isWaiter ? (
@@ -605,27 +640,69 @@ function DroneAgent({
                     <primitive object={coreMat} attach="material" />
                 </mesh>
              </group>
+        ) : !isRobot ? (
+            /* === GUEST: BLUE ELECTRONIC CLOUD === */
+            <group>
+                 {/* 1. Distorted Plasma Core */}
+                 <mesh>
+                    <sphereGeometry args={[0.22, 32, 32]} />
+                    <MeshDistortMaterial 
+                        color="#38bdf8"
+                        emissive="#0284c7"
+                        emissiveIntensity={1.8}
+                        roughness={0.2}
+                        metalness={0.5}
+                        distort={0.55}
+                        speed={3}
+                        toneMapped={false}
+                    />
+                 </mesh>
+
+                 {/* 2. Outer Digital Haze */}
+                 <mesh scale={1.1}>
+                    <sphereGeometry args={[0.24, 32, 32]} />
+                    <meshBasicMaterial 
+                        color="#7dd3fc"
+                        transparent
+                        opacity={0.15}
+                        depthWrite={false}
+                    />
+                 </mesh>
+
+                 {/* 3. Electronic Particles */}
+                 <Sparkles 
+                    count={20} 
+                    scale={1.2} 
+                    size={3} 
+                    speed={1} 
+                    opacity={0.7} 
+                    color="#bae6fd"
+                 />
+
+                 {/* 4. Tiny orbiting bits for "data" feel */}
+                 <group rotation={[Math.PI / 4, 0, 0]}>
+                    <Sparkles count={8} scale={0.5} size={1} speed={2} color="#ffffff" />
+                 </group>
+            </group>
         ) : (
-            /* === STANDARD ROBOT / GUEST === */
+            /* === STANDARD ROBOT (Concierge etc) === */
             <group>
                 <mesh castShadow>
-                  {isRobot ? <icosahedronGeometry args={[0.23, 1]} /> : <sphereGeometry args={[0.22, 32, 32]} />}
+                  <icosahedronGeometry args={[0.23, 1]} />
                   <primitive object={coreMat} attach="material" />
                 </mesh>
 
-                <mesh castShadow scale={isRobot ? 1.25 : 1.18}>
-                  {isRobot ? <octahedronGeometry args={[0.22, 0]} /> : <sphereGeometry args={[0.21, 24, 24]} />}
+                <mesh castShadow scale={1.25}>
+                  <octahedronGeometry args={[0.22, 0]} />
                   <primitive object={shellMat} attach="material" />
                 </mesh>
 
-                {isRobot && (
-                    <group ref={gyroRef}>
-                        <mesh>
-                            <torusGeometry args={[0.34, 0.006, 6, 32]} />
-                            <primitive object={gyroMat} attach="material" />
-                        </mesh>
-                    </group>
-                )}
+                <group ref={gyroRef}>
+                    <mesh>
+                        <torusGeometry args={[0.34, 0.006, 6, 32]} />
+                        <primitive object={gyroMat} attach="material" />
+                    </mesh>
+                </group>
             </group>
         )}
 
@@ -669,7 +746,7 @@ function DroneAgent({
       </group>
     </group>
   );
-}
+};
 
 // --- 6. SEEDCORE ---
 function SeedCoreMonolith({ color }: { color: string }) {
