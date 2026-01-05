@@ -43,12 +43,13 @@ declare global {
       meshBasicMaterial: any;
       meshPhysicalMaterial: any;
       color: any;
+      capsuleGeometry: any;
     }
   }
 }
 
 // --- CONFIGURATION ---
-const WORLD_SCALE = 0.8;
+const WORLD_SCALE = 0.5;
 const CENTER_X = GRID_WIDTH / 2;
 const CENTER_Y = GRID_HEIGHT / 2;
 
@@ -352,10 +353,12 @@ const DroneAgent: React.FC<{
   agent: Agent; 
   themeColor: string; 
   onHover?: (id: string | null) => void;
+  onDoubleClick?: (agent: Agent) => void;
 }> = ({ 
   agent, 
   themeColor, 
-  onHover 
+  onHover,
+  onDoubleClick
 }) => {
   if (!agent || !agent.position) return null;
 
@@ -566,12 +569,23 @@ const DroneAgent: React.FC<{
             if (onHover) onHover(null);
             document.body.style.cursor = 'auto';
         }}
+        onDoubleClick={(e) => {
+            e.stopPropagation();
+            if (onDoubleClick) onDoubleClick(agent);
+        }}
     >
       <Float speed={isRobot ? 2 : 1.2} rotationIntensity={isRobot ? 0.12 : 0.5} floatIntensity={0.12} scale={sizeScale}>
         
         {/* === WAITER ROBOT (REFINED & WELCOMING) === */}
         {isWaiter ? (
              <group>
+                {/* --- HIT VOLUME (INVISIBLE) --- */}
+                {/* Covers body, head, and tray area for easier interaction */}
+                <mesh position={[0, 0.2, 0]}>
+                    <cylinderGeometry args={[0.35, 0.35, 1.2, 16]} />
+                    <meshBasicMaterial transparent opacity={0} depthWrite={false} color="red" />
+                </mesh>
+
                 {/* 1. TAPERED CERAMIC BODY (Delicate Shape) */}
                 <mesh castShadow position={[0, 0, 0]}>
                    {/* Top radius larger than bottom for a sleek "V" or vest shape */}
@@ -643,6 +657,12 @@ const DroneAgent: React.FC<{
         ) : !isRobot ? (
             /* === GUEST: BLUE ELECTRONIC CLOUD === */
             <group>
+                 {/* Hit volume for Guest */}
+                 <mesh>
+                     <sphereGeometry args={[0.35, 16, 16]} />
+                     <meshBasicMaterial transparent opacity={0} depthWrite={false} />
+                 </mesh>
+
                  {/* 1. Distorted Plasma Core */}
                  <mesh>
                     <sphereGeometry args={[0.22, 32, 32]} />
@@ -687,6 +707,12 @@ const DroneAgent: React.FC<{
         ) : (
             /* === STANDARD ROBOT (Concierge etc) === */
             <group>
+                {/* Hit volume for Standard Robot */}
+                <mesh>
+                    <sphereGeometry args={[0.35, 16, 16]} />
+                    <meshBasicMaterial transparent opacity={0} depthWrite={false} />
+                </mesh>
+                
                 <mesh castShadow>
                   <icosahedronGeometry args={[0.23, 1]} />
                   <primitive object={coreMat} attach="material" />
@@ -810,7 +836,8 @@ export function VirtualRealityLayer({
   rooms,
   agents,
   backgroundImage,
-  onAgentHover
+  onAgentHover,
+  onAgentDoubleClick
 }: {
   atmosphere: string;
   enabled: boolean;
@@ -818,6 +845,7 @@ export function VirtualRealityLayer({
   agents: Agent[];
   backgroundImage?: string;
   onAgentHover?: (id: string | null) => void;
+  onAgentDoubleClick?: (agent: Agent) => void;
 }) {
   const isGolden = atmosphere === "GOLDEN_HOUR";
   const themeColor = isGolden ? "#fbbf24" : "#06b6d4";
@@ -1010,6 +1038,7 @@ export function VirtualRealityLayer({
                 agent={agent} 
                 themeColor={themeColor} 
                 onHover={onAgentHover}
+                onDoubleClick={onAgentDoubleClick}
             />
           ))}
 

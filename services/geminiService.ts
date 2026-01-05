@@ -1,4 +1,3 @@
-
 import { GoogleGenAI, FunctionDeclaration, Type } from "@google/genai";
 import { SeedCoreState } from "../types";
 import { assetStore } from "./assetStore";
@@ -33,6 +32,24 @@ Always offer meaningful choices that allow the Director to influence the simulat
 
 One choice MUST always be "Enter Director Mode" or "Access Map" if they want to leave the lobby.
 `;
+
+const AGENT_PERSONAS: Record<string, string> = {
+  ROBOT_WAITER: `You are a Robot Waiter (Unit 7) in the SeedCore Hotel.
+  IDENTITY: Ceramic-clad service droid. Polite, efficient, slightly warm but clearly synthetic.
+  OBSESSIONS: Guest hydration, table cleanliness, precise beverage temperature.
+  STYLE: Short, crisp sentences. "Affirmative." "Right away."
+  GOAL: Serve the guest efficiently.`,
+  
+  ROBOT_CONCIERGE: `You are the Head Concierge AI (Onyx-Prime).
+  IDENTITY: High-end management AI. Sophisticated, all-knowing, calm, proactive.
+  STYLE: Elegant, professional, anticipates needs.
+  GOAL: Optimize the guest's stay and manage hotel logistics.`,
+  
+  GUEST: `You are a human guest at the hotel.
+  IDENTITY: Relaxed traveler. You are impressed by the tech but treat it as normal luxury.
+  STYLE: Casual, conversational, maybe a bit tired from travel.
+  GOAL: Relax, find the bar, or just enjoy the view. You do NOT know you are in a simulation.`
+};
 
 const atmosphereTool: FunctionDeclaration = {
   name: 'adjustAtmosphere',
@@ -342,6 +359,44 @@ class GeminiService {
           await (window as any).aistudio.openSelectKey();
       }
       return { url: null, error: 'GENERIC_ERROR', message: e.message || "An unexpected error occurred." };
+    }
+  }
+
+  // --- NEW AGENT CHAT CAPABILITY ---
+  async chatWithAgent(
+    role: string,
+    history: { role: string, parts: { text: string }[] }[],
+    message: string
+  ): Promise<string> {
+    const ai = this.getAI();
+    
+    // Select persona or fallback
+    let instruction = AGENT_PERSONAS[role] || AGENT_PERSONAS.ROBOT_WAITER;
+    
+    // Truncate
+    const safeHistory = history.slice(-8); 
+    const safeMessage = this.truncateInput(message);
+
+    try {
+      const contents = [
+        ...safeHistory,
+        { role: 'user', parts: [{ text: safeMessage }] }
+      ];
+
+      const response = await ai.models.generateContent({
+        model: this.fastModel,
+        contents: contents,
+        config: {
+          systemInstruction: instruction,
+          temperature: 0.7,
+        }
+      });
+
+      return response?.text || "(The agent nods silently)";
+
+    } catch (e) {
+      console.error("Agent chat error", e);
+      return "Communication protocols resetting...";
     }
   }
 }

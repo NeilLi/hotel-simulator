@@ -3,6 +3,7 @@ import { geminiService, LobbyTurnResult } from '../services/geminiService';
 import { RefreshCw, Map, Power, Cpu, Aperture, MessageSquare, Zap } from 'lucide-react';
 import { SeedCoreState, Room, Agent, AgentRole } from '../types';
 import { VirtualRealityLayer } from './VirtualRealityLayer';
+import { AgentChatInterface } from './AgentChatInterface';
 
 interface VirtualLobbyProps {
   onExitLobby: () => void;
@@ -90,6 +91,9 @@ const AgentInteractionHUD = ({ agentId, agents }: { agentId: string | null, agen
           <p className="text-[11px] text-cyan-100 font-mono leading-relaxed">
              "{task}..."
           </p>
+          <div className="mt-2 text-[8px] text-cyan-500/60 font-bold uppercase tracking-widest animate-pulse">
+            Double Click to Chat
+          </div>
           
           <div className="mt-3 flex justify-center gap-1">
              <div className="w-1 h-1 bg-cyan-500 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
@@ -118,6 +122,8 @@ export const VirtualLobby: React.FC<VirtualLobbyProps> = ({
   const [lobbyImage, setLobbyImage] = useState<string | null>(USER_LOBBY_IMAGE);
   const [isVisualLoading, setIsVisualLoading] = useState(false);
   const [hoveredAgent, setHoveredAgent] = useState<string | null>(null);
+
+  const [chattingAgent, setChattingAgent] = useState<Agent | null>(null);
 
   // FIX: Added history.length dependency to prevent infinite loops or missed inits
   useEffect(() => {
@@ -183,10 +189,16 @@ export const VirtualLobby: React.FC<VirtualLobbyProps> = ({
         agents={agents} 
         backgroundImage={safeImageSrc(lobbyImage || USER_LOBBY_IMAGE)}
         onAgentHover={handleAgentHover}
+        onAgentDoubleClick={(agent) => setChattingAgent(agent)}
       />
 
       {/* --- LAYER 1.5: INTERACTION HUD --- */}
       <AgentInteractionHUD agentId={hoveredAgent} agents={agents} />
+      
+      {/* --- LAYER 1.7: AGENT CHAT INTERFACE --- */}
+      {chattingAgent && (
+        <AgentChatInterface agent={chattingAgent} onClose={() => setChattingAgent(null)} />
+      )}
 
       {/* --- LAYER 0: STATIC FALLBACK (Visible only when AI OFF) --- */}
       <div className={`absolute inset-0 z-0 bg-neutral-950 transition-opacity duration-1000 ${isAiEnabled ? 'opacity-0 delay-500' : 'opacity-100'}`}>
