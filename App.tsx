@@ -1,14 +1,12 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { Aperture, Map, Film, X, Activity, Clock, Power, Cpu, AlertTriangle, Layers, Terminal, Loader2 } from 'lucide-react';
 import { geminiService } from './services/geminiService';
-import { generateMap, generateAgents, updateAgentsLogic, updateAgentsDialogue, generateDialogueForAgent, setConversingAgent } from './utils/simulationUtils';
+import { generateMap, generateAgents, updateAgentsLogic } from './utils/simulationUtils';
 import { EntityType, Room, Agent, SeedCoreState, SeedCorePlane } from './types';
 import { GRID_WIDTH, GRID_HEIGHT, TICK_RATE_MS } from './constants';
 import { SvgHotelBackdrop } from './components/SvgHotelBackdrop';
 import { VirtualLobby } from './components/VirtualLobby';
 import { ConciergePanel } from './components/ConciergePanel';
-import { useEventTracking } from './hooks/useEventTracking';
-import { kafkaPublisher } from './services/kafkaPublisher';
 
 // --- SIDEBAR COMPONENT: SENSORY TELEMETRY (LEFT) ---
 const SensoryTelemetryPanel = ({ active }: { active: boolean }) => {
@@ -67,7 +65,11 @@ const App: React.FC = () => {
   const [grid, setGrid] = useState<EntityType[][]>([]);
   const [rooms, setRooms] = useState<Room[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
+  
+  // Interaction State
   const [selectedRoom, setSelectedRoom] = useState<Room | null>(null);
+  const [interactingAgentId, setInteractingAgentId] = useState<string | null>(null);
+
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [isVideoLoading, setIsVideoLoading] = useState(false);
   
@@ -76,14 +78,6 @@ const App: React.FC = () => {
     logs: [],
     timeOfDay: 8.0 
   });
-
-  // Initialize event tracking (connects eventEmitter to kafkaPublisher)
-  useEventTracking();
-
-  // Update kafkaPublisher AI state when it changes
-  useEffect(() => {
-    kafkaPublisher.setAiEnabled(isAiEnabled);
-  }, [isAiEnabled]);
 
   useEffect(() => {
     const { grid: g, rooms: r } = generateMap(GRID_WIDTH, GRID_HEIGHT);
@@ -96,32 +90,17 @@ const App: React.FC = () => {
   const tick = useCallback(async () => {
     // Fix: Defensive check to prevent accessing property of undefined
     if (!grid || !Array.isArray(grid) || !grid.length) return;
-    setAgents(prev => updateAgentsLogic(prev || [], grid, coreState));
+    
+    // Pass interactingAgentId to freeze logic
+    setAgents(prev => updateAgentsLogic(prev || [], grid, interactingAgentId));
     setCoreState(prev => ({ ...prev, timeOfDay: (prev.timeOfDay + 0.05) % 24 }));
-  }, [grid, coreState]);
+  }, [grid, interactingAgentId]);
 
   useEffect(() => {
     if (!isInitialized) return;
     const interval = setInterval(tick, TICK_RATE_MS);
     return () => clearInterval(interval);
   }, [isInitialized, tick]);
-
-  // Separate effect for dialogue generation (runs less frequently to avoid API spam)
-  useEffect(() => {
-    if (!isInitialized || !isAiEnabled) return;
-    
-    const dialogueInterval = setInterval(async () => {
-      await updateAgentsDialogue(agents, coreState, (agentId, dialogue, audioUrl) => {
-        setAgents(prev => prev.map(agent => 
-          agent.id === agentId 
-            ? { ...agent, dialogue, audioUrl, lastDialogueTime: Date.now() }
-            : agent
-        ));
-      });
-    }, 20000); // Check for dialogue generation every 20 seconds
-
-    return () => clearInterval(dialogueInterval);
-  }, [isInitialized, isAiEnabled, agents, coreState]);
 
   const requestShot = async (desc: string) => {
     if (!isAiEnabled) return;
@@ -150,70 +129,7 @@ const App: React.FC = () => {
             setIsAiEnabled={setIsAiEnabled}
             rooms={rooms}
             agents={agents}
-            onAgentClick={async (agentId) => {
-              setAgents(prev => {
-                const clickedAgent = prev.find(a => a.id === agentId);
-                if (!clickedAgent) return prev;
-                
-                // Only allow waiters and guests to enter conversation
-                const canConversate = clickedAgent.role === 'ROBOT_WAITER' || clickedAgent.role === 'GUEST';
-                if (!canConversate) return prev;
-                
-                // Get previous conversing agent and exit it
-                const previousConversingAgentId = setConversingAgent(agentId);
-                
-                // Update agents: exit previous conversing agent, enter new one
-                const updatedAgents = prev.map(agent => {
-                  // Exit previous conversing agent
-                  if (previousConversingAgentId && agent.id === previousConversingAgentId) {
-                    return { 
-                      ...agent, 
-                      state: 'PAUSING' as const,
-                      isGeneratingDialogue: false
-                    };
-                  }
-                  // Enter conversation for clicked agent
-                  if (agent.id === agentId) {
-                    return { 
-                      ...agent, 
-                      state: 'CONVERSING' as const, 
-                      target: { ...agent.position }, // Stop movement immediately
-                      isGeneratingDialogue: true // Show loading state
-                    };
-                  }
-                  return agent;
-                });
-                
-                // Find the clicked agent and generate dialogue immediately
-                const updatedClickedAgent = updatedAgents.find(a => a.id === agentId);
-                if (updatedClickedAgent && isAiEnabled) {
-                  // Generate dialogue immediately for the clicked agent (queued to prevent concurrent calls)
-                  generateDialogueForAgent(updatedClickedAgent, updatedAgents, coreState, (agentId, dialogue, audioUrl) => {
-                    setAgents(current => current.map(agent => 
-                      agent.id === agentId 
-                        ? { 
-                            ...agent, 
-                            dialogue, 
-                            audioUrl, 
-                            lastDialogueTime: Date.now(),
-                            isGeneratingDialogue: false // Clear loading state
-                          }
-                        : agent
-                    ));
-                  }).catch(error => {
-                    // Clear loading state on error
-                    setAgents(current => current.map(agent => 
-                      agent.id === agentId 
-                        ? { ...agent, isGeneratingDialogue: false, state: 'PAUSING' as const }
-                        : agent
-                    ));
-                    console.error('Failed to generate dialogue:', error);
-                  });
-                }
-                
-                return updatedAgents;
-              });
-            }}
+            onAgentHover={(id) => setInteractingAgentId(id)}
           />
         </div>
       ) : (
