@@ -7,12 +7,16 @@ import {
   Sparkles,
   Grid,
   MeshReflectorMaterial,
+  useHelper,
 } from "@react-three/drei";
 import { EffectComposer, Bloom, Noise, Vignette } from "@react-three/postprocessing";
 import * as THREE from "three";
 import type { Room, Agent } from "../types";
 import { GRID_WIDTH, GRID_HEIGHT } from "../constants";
 import { DroneAgent } from "./DroneAgent";
+
+// Initialize RectAreaLights for luxury area lighting
+// This will be initialized in useEffect to avoid build-time import issues
 
 // Fix for missing R3F types in JSX
 declare global {
@@ -28,6 +32,7 @@ declare global {
       hemisphereLight: any;
       directionalLight: any;
       fogExp2: any;
+      fog: any;
       gridHelper: any;
       boxGeometry: any;
       sphereGeometry: any;
@@ -52,7 +57,7 @@ declare global {
 type Quality = "safe" | "medium" | "high";
 
 // -----------------------------
-// 1) CINEMATIC CAMERA
+// 1) REFINED CINEMATIC CAMERA
 // -----------------------------
 function CinematicCamera() {
   const { camera, pointer } = useThree();
@@ -60,17 +65,11 @@ function CinematicCamera() {
 
   useFrame((state) => {
     const time = state.clock.getElapsedTime();
+    // Smoother, slower drift for luxury feel
+    const driftX = Math.sin(time * 0.2) * 0.5;
+    const driftY = Math.cos(time * 0.2) * 0.2;
 
-    const baseX = 0;
-    const baseY = 3.5;
-    const baseZ = 22;
-
-    const mouseX = pointer.x * 2;
-    const mouseY = pointer.y * 1;
-
-    const driftX = Math.sin(time * 0.05) * 2;
-
-    camera.position.lerp(vec.set(baseX + mouseX + driftX, baseY + mouseY, baseZ), 0.02);
+    camera.position.lerp(vec.set(pointer.x * 2 + driftX, 3.5 + pointer.y + driftY, 22), 0.03);
     camera.lookAt(0, 2, 0);
   });
 
@@ -174,7 +173,32 @@ function DataStreamBackground({ themeColor }: { themeColor: string }) {
 }
 
 // -----------------------------
-// 4) ARCHITECTURAL LIGHT PANELS (cheap color wash)
+// 4) ARCHITECTURAL LIGHTING (Luxury RectAreaLights)
+// -----------------------------
+function ArchitecturalLights({ isGolden }: { isGolden: boolean }) {
+  const lightColor = isGolden ? "#ffdfad" : "#e0f2fe";
+  
+  return (
+    <group>
+      {/* Large Ceiling Softbox - Creates soft, realistic shadows */}
+      <rectAreaLight
+        width={15}
+        height={30}
+        intensity={isGolden ? 5 : 8}
+        color={lightColor}
+        position={[0, 12, 0]}
+        rotation={[-Math.PI / 2, 0, 0]}
+      />
+      
+      {/* Accent Rim Lights for Columns */}
+      <pointLight position={[15, 5, 5]} intensity={20} color={lightColor} distance={30} decay={2} />
+      <pointLight position={[-15, 5, 5]} intensity={20} color={lightColor} distance={30} decay={2} />
+    </group>
+  );
+}
+
+// -----------------------------
+// 4b) ARCHITECTURAL LIGHT PANELS (cheap color wash) - kept for compatibility
 // -----------------------------
 function LightPanels({ a, b }: { a: string; b: string }) {
   return (
@@ -278,8 +302,8 @@ function Mezzanine({
 }
 
 // -----------------------------
-// 7) LOBBY ENVIRONMENT
-//    - No transmission (sandbox stability)
+// 7) LOBBY ENVIRONMENT (Luxury Materials)
+//    - Physical materials with clearcoat for luxury feel
 // -----------------------------
 function LobbyEnvironment({
   themeColor,
@@ -300,10 +324,33 @@ function LobbyEnvironment({
 }) {
   return (
     <group>
+      {/* MONOLITH DISPLAY BASE */}
+      <mesh position={[0, 0.05, -2]}>
+        <cylinderGeometry args={[4, 4.2, 0.1, 64]} />
+        <meshStandardMaterial color="#000" metalness={1} roughness={0.2} />
+      </mesh>
+
       {/* RECEPTION */}
       <group position={[0, 0, -2]}>
+        {/* Reception Desk - Physical Marble Look */}
+        <RoundedBox args={[12, 1.2, 2.5]} radius={0.05} position={[0, 0.6, -6]}>
+          <meshPhysicalMaterial
+            color={isGolden ? "#1a1612" : "#0f172a"}
+            metalness={0.2}
+            roughness={0.1}
+            clearcoat={1}
+            envMapIntensity={2}
+          />
+        </RoundedBox>
+
         <RoundedBox args={[10, 1.1, 3]} radius={0.2} smoothness={8} position={[0, 0.55, 0]}>
-          <meshStandardMaterial color="#161a24" roughness={0.25} metalness={0.65} envMapIntensity={1.2} />
+          <meshPhysicalMaterial 
+            color={isGolden ? "#1a1612" : "#0f172a"} 
+            roughness={0.1} 
+            metalness={0.2} 
+            clearcoat={1}
+            envMapIntensity={1.2} 
+          />
         </RoundedBox>
 
         <mesh position={[0, 0.08, 0]}>
@@ -348,21 +395,26 @@ function LobbyEnvironment({
         </Float>
       </group>
 
-      {/* COLUMNS */}
+      {/* COLUMNS - Brushed Bronze/Steel with Physical Materials */}
       {[-14, 14].map((sideX) => (
         <group key={sideX}>
           {[-5, 10].map((zPos) => (
             <group key={zPos} position={[sideX, 6, zPos]}>
               <mesh castShadow receiveShadow>
                 <cylinderGeometry args={[2, 2, 12, 28]} />
-                <meshStandardMaterial
-                  color={isGolden ? "#4a3424" : "#2b3242"}
-                  roughness={0.55}
-                  metalness={0.08}
-                  emissive={isGolden ? "#2a1a10" : "#0a1020"}
-                  emissiveIntensity={0.22}
+                <meshPhysicalMaterial
+                  color={isGolden ? "#2b2319" : "#1e293b"}
+                  metalness={0.8}
+                  roughness={0.3}
+                  clearcoat={0.5}
                   envMapIntensity={1.0}
                 />
+              </mesh>
+              
+              {/* Subtle Glow Ring */}
+              <mesh position={[0, -5.8, 0]}>
+                <torusGeometry args={[1.6, 0.02, 16, 64]} />
+                <meshBasicMaterial color={themeColor} />
               </mesh>
 
               <mesh position={[0, -5.6, 0]} castShadow receiveShadow>
@@ -602,11 +654,35 @@ export function VirtualRealityLayer({
   onAgentDoubleClick?: (agent: Agent) => void;
 }) {
   const isGolden = atmosphere === "GOLDEN_HOUR";
-  const themeColor = isGolden ? "#fbbf24" : "#06b6d4";
+  const themeColor = isGolden ? "#d4af37" : "#60a5fa"; // Metallic Gold or Soft Blue for luxury
   const safeAgents = useMemo(() => (Array.isArray(agents) ? agents : []), [agents]);
 
   const [lockedSafe, setLockedSafe] = useState(false);
   const [postFxDisabled, setPostFxDisabled] = useState(false);
+
+  // Initialize RectAreaLightUniformsLib for luxury lighting
+  useEffect(() => {
+    if (enabled) {
+      import("three/examples/jsm/lights/RectAreaLightUniformsLib.js")
+        .then((module) => {
+          if (module.RectAreaLightUniformsLib) {
+            module.RectAreaLightUniformsLib.init();
+          }
+        })
+        .catch(() => {
+          // Try alternative path
+          import("three/addons/lights/RectAreaLightUniformsLib.js")
+            .then((module) => {
+              if (module.RectAreaLightUniformsLib) {
+                module.RectAreaLightUniformsLib.init();
+              }
+            })
+            .catch(() => {
+              // RectAreaLight may work without explicit init in some versions
+            });
+        });
+    }
+  }, [enabled]);
 
   // Quality + FPS (stable)
   // NOTE: useFrame inside hook requires Canvas, so we render a small child below to run the hook.
@@ -658,12 +734,12 @@ export function VirtualRealityLayer({
       <Canvas
         shadows
         dpr={dpr}
-        camera={{ fov: 50, position: [0, 4, 20], near: 0.1, far: 200 }}
+        camera={{ fov: 45, position: [0, 4, 22], near: 0.1, far: 200 }}
         gl={{ antialias: true, alpha: false, depth: true, stencil: false, powerPreference: "high-performance" }}
         onCreated={({ gl }) => {
           gl.outputColorSpace = THREE.SRGBColorSpace;
           gl.toneMapping = THREE.ACESFilmicToneMapping;
-          gl.toneMappingExposure = 1.40;
+          gl.toneMappingExposure = 1.2; // Slightly reduced for luxury feel
 
           gl.shadowMap.enabled = true;
           gl.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -690,16 +766,19 @@ export function VirtualRealityLayer({
 
         <CinematicCamera />
         <GradientBackdrop isGolden={isGolden} />
-        <fogExp2 attach="fog" args={[isGolden ? "#451a03" : "#0f172a", 0.012]} />
+        {/* Linear fog for luxury feel - matches background color */}
+        <fog attach="fog" args={[isGolden ? "#0a0806" : "#020408", 15, 45]} />
 
         <Suspense fallback={null}>
           <Environment preset={isGolden ? "sunset" : "city"} blur={0.25} background={false} />
         </Suspense>
 
-        {/* Brighter base so it’s not “black lobby” */}
-        <ambientLight intensity={0.9} />
-        <hemisphereLight args={[isGolden ? "#fcd34d" : "#22d3ee", "#1e1b4b", 1.15]} />
-
+        {/* Architectural Lighting - Luxury soft area lights */}
+        <ambientLight intensity={0.2} />
+        <ArchitecturalLights isGolden={isGolden} />
+        
+        {/* Additional fill lights for depth */}
+        <hemisphereLight args={[isGolden ? "#ffdfad" : "#e0f2fe", "#1e1b4b", 0.5]} />
         <pointLight position={[0, 10, 0]} intensity={2.2} distance={80} decay={1} color="#ffffff" />
         <spotLight
           position={[20, 30, 20]}
@@ -722,51 +801,50 @@ export function VirtualRealityLayer({
         <pointLight position={[0, 5, 18]} intensity={1.2} distance={80} decay={2} color="#ffffff" />
 
         <group>
-          {/* FLOOR */}
+          {/* LUXURY FLOOR - Deep charcoal with polished obsidian reflection */}
           <mesh rotation={[-Math.PI / 2, 0, 0]} receiveShadow>
             <planeGeometry args={[100, 100]} />
             {allowReflector ? (
               <MeshReflectorMaterial
-                resolution={256}
-                blur={[60, 16]}
-                mixBlur={0.5}
-                mixStrength={8}
-                roughness={0.14}
-                metalness={0.32}
-                color={isGolden ? "#1a1f2e" : "#151b2a"}
-                depthScale={0.5}
-                minDepthThreshold={0.75}
-                maxDepthThreshold={1.05}
-                mirror={0.16}
+                blur={[400, 100]} // High blur for soft, expensive reflections
+                resolution={1024}
+                mixBlur={1}
+                mixStrength={15}
+                roughness={1}
+                depthScale={1.2}
+                minDepthThreshold={0.4}
+                maxDepthThreshold={1.4}
+                color={isGolden ? "#0a0908" : "#05070a"} // Deep charcoal/black base
+                metalness={0.5}
+                mirror={0.5} // Partial mirror
               />
             ) : (
               // Medium/safe: polished physical floor (stable, brighter)
               <meshPhysicalMaterial
-                color={isGolden ? "#1a1f2e" : "#151b2a"}
-                roughness={quality === "medium" ? 0.22 : 0.35}
-                metalness={0.25}
-                clearcoat={quality === "medium" ? 0.9 : 0.65}
-                clearcoatRoughness={quality === "medium" ? 0.18 : 0.25}
+                color={isGolden ? "#0a0908" : "#05070a"}
+                roughness={quality === "medium" ? 0.1 : 0.2}
+                metalness={0.2}
+                clearcoat={1}
+                clearcoatRoughness={quality === "medium" ? 0.1 : 0.2}
                 envMapIntensity={1.15}
               />
             )}
           </mesh>
 
-          {/* Grid: subtle floor etching - reflection-safe */}
+          {/* Clean Grid: subtle floor etching - very low opacity */}
           <Grid
-            args={[60, 60]}
-            cellSize={2}
-            cellThickness={0.35}
-            cellColor={themeColor}
-            sectionSize={10}
-            sectionThickness={0.7}
-            sectionColor={themeColor}
-            fadeDistance={22}
-            followCamera={false}
-            infiniteGrid={false}
-            position={[0, 0.02, 0]}
+            args={[80, 80]}
+            cellSize={4}
+            cellThickness={0.5}
+            cellColor={isGolden ? "#443b2a" : "#1e293b"}
+            sectionSize={20}
+            sectionThickness={1}
+            sectionColor={isGolden ? "#5c4d32" : "#334155"}
+            fadeDistance={30}
+            position={[0, 0.01, 0]}
+            infiniteGrid
             material-transparent
-            material-opacity={0.35}
+            material-opacity={0.15}
             material-depthWrite={false}
             material-toneMapped={false}
           />
