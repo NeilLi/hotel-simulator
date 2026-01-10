@@ -1,12 +1,12 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { geminiService, LobbyTurnResult } from '../services/geminiService';
-import { RefreshCw, Map, Power, Cpu, Aperture, MessageSquare, Zap } from 'lucide-react';
+import { RefreshCw, Map, Power, Cpu, Aperture, MessageSquare, Zap, Hammer } from 'lucide-react';
 import { SeedCoreState, Room, Agent, AgentRole } from '../types';
 import { VirtualRealityLayer } from './VirtualRealityLayer';
 import { AgentChatInterface } from './AgentChatInterface';
 
 interface VirtualLobbyProps {
-  onExitLobby: () => void;
+  onNavigate: (view: 'MAP' | 'DIY') => void;
   coreState: SeedCoreState;
   updateCoreState: (updates: Partial<SeedCoreState>) => void;
   isAiEnabled: boolean;
@@ -106,7 +106,7 @@ const AgentInteractionHUD = ({ agentId, agents }: { agentId: string | null, agen
 }
 
 export const VirtualLobby: React.FC<VirtualLobbyProps> = ({ 
-  onExitLobby, 
+  onNavigate, 
   coreState, 
   updateCoreState,
   isAiEnabled,
@@ -300,8 +300,18 @@ export const VirtualLobby: React.FC<VirtualLobbyProps> = ({
 
                  {choices.length > 0 && <div className="w-px h-8 bg-white/10 mx-2" />}
 
+                 {/* DIY Era Button */}
                  <button 
-                   onClick={onExitLobby}
+                   onClick={() => onNavigate('DIY')}
+                   className="px-7 py-3.5 bg-slate-800 text-cyan-400 border border-cyan-500/20 rounded-xl hover:bg-cyan-500/10 transition-all text-[10px] font-bold uppercase tracking-[0.2em] shadow-lg active:scale-95 flex items-center gap-3"
+                 >
+                    <Hammer size={14} />
+                    Explore DIY Era
+                 </button>
+
+                 {/* Director Map Button */}
+                 <button 
+                   onClick={() => onNavigate('MAP')}
                    className="px-7 py-3.5 bg-white text-black rounded-xl hover:bg-cyan-50 transition-all text-[10px] font-bold uppercase tracking-[0.2em] shadow-xl active:scale-95 flex items-center gap-3"
                  >
                     <Map size={14} />

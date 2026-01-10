@@ -84,6 +84,30 @@ export interface LobbyTurnResult {
   worldStateUpdate?: { atmosphere?: string; timeOffset?: number };
 }
 
+// Type for Wearable Studio
+export interface WearableDesignResult {
+  imageUrl: string | null;
+  specs: {
+    fabricType: string;
+    primaryColor: string;
+    threadCount: number;
+    careInstructions: string;
+    designConcept: string;
+  } | null;
+}
+
+// Type for Magic Atelier (Toy Design)
+export interface ToyDesignResult {
+  imageUrl: string | null;
+  blueprint: {
+    name: string;
+    personality: string;
+    superpower: string;
+    assemblyInstructions: string;
+    accessoryList: string[];
+  } | null;
+}
+
 class GeminiService {
   // Fix: Use gemini-3-pro-preview for complex reasoning and coding tasks as per guidelines
   private logicModel = "gemini-3-pro-preview";
@@ -397,6 +421,237 @@ class GeminiService {
     } catch (e) {
       console.error("Agent chat error", e);
       return "Communication protocols resetting...";
+    }
+  }
+
+  // --- WEARABLE STORY STUDIO ---
+  async designWearable(story: string, style: string, type: string): Promise<WearableDesignResult> {
+    const ai = this.getAI();
+    const safeStory = this.truncateInput(story, 300);
+
+    const specsSchema = {
+      type: Type.OBJECT,
+      properties: {
+        visualPrompt: { type: Type.STRING, description: "Detailed prompt for an image generator describing a high fashion t-shirt print." },
+        fabricType: { type: Type.STRING },
+        primaryColor: { type: Type.STRING },
+        threadCount: { type: Type.NUMBER },
+        careInstructions: { type: Type.STRING },
+        designConcept: { type: Type.STRING, description: "Short poetic description of the design philosophy." }
+      },
+      required: ['visualPrompt', 'fabricType', 'primaryColor', 'designConcept']
+    };
+
+    let specs = null;
+    let visualPrompt = "";
+
+    try {
+      const specsResponse = await ai.models.generateContent({
+        model: this.fastModel,
+        contents: `Analyze this user story for a wearable fashion item (${type}, style: ${style}). 
+        Story: "${safeStory}". 
+        Output JSON with a 'visualPrompt' for an image generator (describe the graphical print/pattern on the clothes) and manufacturing parameters.`,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: specsSchema
+        }
+      });
+      
+      if (specsResponse.text) {
+         specs = JSON.parse(specsResponse.text);
+         visualPrompt = specs.visualPrompt;
+      }
+    } catch (e) {
+      console.warn("Wearable specs generation failed, using fallback.", e);
+      visualPrompt = `A ${style} ${type} design inspired by: ${safeStory}`;
+      specs = {
+        fabricType: "Organic Cotton Blend",
+        primaryColor: "Monochrome",
+        threadCount: 400,
+        careInstructions: "Cold wash only.",
+        designConcept: "A direct translation of memory into matter."
+      };
+    }
+
+    const imagePrompt = `High quality product photography, flat lay of a ${style} ${type} on a white background. 
+    The ${type} features a graphic design: ${visualPrompt}. 
+    Professional studio lighting, 4k, detailed texture.`;
+
+    let imageUrl = null;
+    try {
+        const imageResponse = await ai.models.generateContent({
+          model: 'gemini-2.5-flash-image',
+          contents: { parts: [{ text: imagePrompt }] },
+          config: {
+            imageConfig: { aspectRatio: "1:1" }
+          }
+        });
+
+        if (imageResponse.candidates?.[0]?.content?.parts) {
+          for (const part of imageResponse.candidates[0].content.parts) {
+             if (part.inlineData?.data) {
+                imageUrl = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+             }
+          }
+        }
+    } catch (e) {
+      console.error("Wearable image generation failed", e);
+    }
+
+    return {
+      imageUrl,
+      specs
+    };
+  }
+
+  // --- MAGIC ATELIER (KIDS TOY DESIGN) ---
+  async designToy(templateName: string, wish: string): Promise<ToyDesignResult> {
+    const ai = this.getAI();
+    const safeWish = this.truncateInput(wish, 200);
+
+    // 1. Generate "Soul" (Character & Instructions)
+    const toySchema = {
+       type: Type.OBJECT,
+       properties: {
+          name: { type: Type.STRING },
+          personality: { type: Type.STRING, description: "A fun, kid-friendly personality description." },
+          superpower: { type: Type.STRING },
+          assemblyInstructions: { type: Type.STRING, description: "Simple steps to build the custom accessory." },
+          accessoryList: { type: Type.ARRAY, items: { type: Type.STRING } },
+          visualPrompt: { type: Type.STRING, description: "Prompt for image generator: 'A 3D render of a [templateName] toy featuring [accessory]...'"}
+       },
+       required: ['name', 'personality', 'superpower', 'assemblyInstructions', 'visualPrompt']
+    };
+
+    let blueprint = null;
+    let visualPrompt = "";
+
+    try {
+       const response = await ai.models.generateContent({
+          model: this.fastModel,
+          contents: `You are a magical toymaker. A child wants to customize a "${templateName}" toy.
+          Their wish: "${safeWish}".
+          Create a fun character profile and a list of 3D printable accessories to make this wish come true.
+          Generate an image prompt for the toy wearing these custom accessories.`,
+          config: {
+             responseMimeType: "application/json",
+             responseSchema: toySchema,
+             systemInstruction: "You are a friendly, imaginative AI helper for kids."
+          }
+       });
+
+       if (response.text) {
+          blueprint = JSON.parse(response.text);
+          visualPrompt = blueprint.visualPrompt;
+       }
+    } catch (e) {
+       console.error("Toy blueprint generation failed", e);
+       visualPrompt = `A 3D render of a ${templateName} toy with ${safeWish} accessories. Cute, colorful, studio lighting.`;
+       blueprint = {
+          name: "Sparky",
+          personality: "A cheerful robot friend.",
+          superpower: "Friendship",
+          assemblyInstructions: "Snap the new parts onto the back chassis.",
+          accessoryList: ["Custom Booster Pack"],
+       };
+    }
+
+    // 2. Generate Image
+    let imageUrl = null;
+    try {
+        const imageResponse = await ai.models.generateContent({
+          model: 'gemini-2.5-flash-image',
+          contents: { parts: [{ text: `Cute 3D render, vibrant colors, toy photography. ${visualPrompt}` }] },
+          config: { imageConfig: { aspectRatio: "1:1" } }
+        });
+
+        if (imageResponse.candidates?.[0]?.content?.parts) {
+          for (const part of imageResponse.candidates[0].content.parts) {
+             if (part.inlineData?.data) {
+                imageUrl = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+             }
+          }
+        }
+    } catch (e) {
+      console.error("Toy image generation failed", e);
+    }
+
+    return { imageUrl, blueprint };
+  }
+
+  // --- JOURNEY STUDIO (TRAVEL VIDEO) ---
+  async constructJourneyContext(userStory: string): Promise<string> {
+    const ai = this.getAI();
+    try {
+      const response = await ai.models.generateContent({
+        model: this.fastModel,
+        contents: `You are a cinematic director for a travel documentary.
+        User Story: "${this.truncateInput(userStory, 1000)}"
+        Task: Enhance this story into a vivid, visual description suitable for video generation. 
+        Focus on lighting, atmosphere, movement, and the character's emotional journey. 
+        Keep it under 60 words.`,
+      });
+      return response.text || userStory;
+    } catch (e) {
+      console.warn("Story context construction failed", e);
+      return userStory;
+    }
+  }
+
+  async generateJourneyVideo(prompt: string, imageBase64: string, mimeType: string = 'image/jpeg'): Promise<GenerationResult> {
+    if (this.checkVideoQuota()) {
+      return { url: null, error: 'LIMIT_REACHED', message: "Demo Limit: 1 Video Generation per Session (Persistent)" };
+    }
+
+    if (typeof window !== 'undefined' && (window as any).aistudio) {
+      if (!(await (window as any).aistudio.hasSelectedApiKey())) {
+        await (window as any).aistudio.openSelectKey();
+      }
+    }
+
+    // Force new instance to capture fresh key
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+
+    try {
+      // Clean base64 string if it contains data prefix
+      const cleanBase64 = imageBase64.split(',')[1] || imageBase64;
+
+      let operation = await ai.models.generateVideos({
+        model: 'veo-3.1-fast-generate-preview',
+        prompt: prompt,
+        image: {
+          imageBytes: cleanBase64,
+          mimeType: mimeType,
+        },
+        config: {
+          numberOfVideos: 1,
+          resolution: '720p',
+          aspectRatio: '16:9'
+        }
+      });
+
+      while (!operation.done) {
+        await new Promise(resolve => setTimeout(resolve, 5000)); // Faster polling for fast model
+        operation = await ai.operations.getVideosOperation({ operation: operation });
+      }
+
+      const downloadLink = operation.response?.generatedVideos?.[0]?.video?.uri;
+      if (!downloadLink) return { url: null, error: 'GENERIC_ERROR', message: "No video URI returned." };
+
+      const finalUrl = `${downloadLink}&key=${process.env.API_KEY}`;
+      const videoResponse = await fetch(finalUrl);
+      if (videoResponse.ok) {
+        const blob = await videoResponse.blob();
+        this.markVideoQuotaUsed();
+        return { url: URL.createObjectURL(blob) };
+      }
+      return { url: null, error: 'GENERIC_ERROR', message: "Failed to download media." };
+    } catch (e: any) {
+      console.error("Veo Journey Error:", e);
+      if (e.message?.includes("Requested entity was not found.") && typeof window !== 'undefined' && (window as any).aistudio) {
+          await (window as any).aistudio.openSelectKey();
+      }
+      return { url: null, error: 'GENERIC_ERROR', message: e.message || "An unexpected error occurred." };
     }
   }
 }

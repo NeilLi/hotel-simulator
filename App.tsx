@@ -7,6 +7,7 @@ import { GRID_WIDTH, GRID_HEIGHT, TICK_RATE_MS } from './constants';
 import { DirectorMapLayer } from './components/DirectorMapLayer'; // Updated Import
 import { VirtualLobby } from './components/VirtualLobby';
 import { ConciergePanel } from './components/ConciergePanel';
+import { DIYEraLuxPortal } from './components/DIYEraLayer';
 
 // --- SIDEBAR COMPONENT: SENSORY TELEMETRY (LEFT) ---
 const SensoryTelemetryPanel = ({ active }: { active: boolean }) => {
@@ -59,7 +60,7 @@ const SensoryTelemetryPanel = ({ active }: { active: boolean }) => {
 // --- MAIN APP COMPONENT ---
 const App: React.FC = () => {
   const [isInitialized, setIsInitialized] = useState(false);
-  const [inLobby, setInLobby] = useState(true);
+  const [activeView, setActiveView] = useState<'LOBBY' | 'MAP' | 'DIY'>('LOBBY');
   const [isAiEnabled, setIsAiEnabled] = useState(false);
   
   const [grid, setGrid] = useState<EntityType[][]>([]);
@@ -131,10 +132,10 @@ const App: React.FC = () => {
     <div className="relative w-screen h-screen bg-[#020617] overflow-hidden text-slate-200 font-system selection:bg-cyan-500/20">
       
       {/* VIRTUAL LOBBY (MAIN SCREEN) */}
-      {inLobby ? (
+      {activeView === 'LOBBY' && (
         <div className="absolute inset-0 z-50 animate-in fade-in duration-700">
            <VirtualLobby 
-            onExitLobby={() => setInLobby(false)}
+            onNavigate={(view) => setActiveView(view)}
             coreState={coreState}
             updateCoreState={(updates) => setCoreState(prev => ({ ...prev, ...updates }))}
             isAiEnabled={isAiEnabled}
@@ -144,8 +145,20 @@ const App: React.FC = () => {
             onAgentHover={(id) => setInteractingAgentId(id)}
           />
         </div>
-      ) : (
-        /* --- DIRECTOR MAP INTERFACE --- */
+      )}
+
+      {/* DIY ERA LAYER */}
+      {activeView === 'DIY' && (
+        <div className="absolute inset-0 z-50 animate-in fade-in duration-700">
+            <DIYEraLuxPortal 
+              onBack={() => setActiveView('LOBBY')} 
+              onEnterZone={(id) => console.log("Entered Zone:", id)}
+            />
+        </div>
+      )}
+
+      {/* DIRECTOR MAP INTERFACE */}
+      {activeView === 'MAP' && (
         <div className="w-full h-full relative flex flex-col animate-in fade-in zoom-in-95 duration-1000">
           
           {/* DYNAMIC WEBGL MAP BACKDROP (Replaces SVG) */}
@@ -184,7 +197,7 @@ const App: React.FC = () => {
                 </button>
 
                 <button 
-                  onClick={() => setInLobby(true)} 
+                  onClick={() => setActiveView('LOBBY')} 
                   className="px-8 py-2.5 bg-white text-black rounded-full text-[9px] font-bold uppercase tracking-[0.2em] transition-all hover:bg-cyan-400 shadow-xl"
                 >
                   FPV Mode

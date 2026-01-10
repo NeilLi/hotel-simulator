@@ -7,7 +7,7 @@ import {
   Sparkles,
   Grid,
   MeshReflectorMaterial,
-  useHelper,
+  Preload,
 } from "@react-three/drei";
 import { EffectComposer, Bloom, Noise, Vignette } from "@react-three/postprocessing";
 import * as THREE from "three";
@@ -15,41 +15,38 @@ import type { Room, Agent } from "../types";
 import { GRID_WIDTH, GRID_HEIGHT } from "../constants";
 import { DroneAgent } from "./DroneAgent";
 
-// Initialize RectAreaLights for luxury area lighting
-// This will be initialized in useEffect to avoid build-time import issues
-
-// Fix for missing R3F types in JSX
+// Fix: Add explicit declaration for JSX Intrinsic Elements to support React Three Fiber components
 declare global {
   namespace JSX {
     interface IntrinsicElements {
-      div: any;
-      group: any;
-      mesh: any;
-      primitive: any;
       ambientLight: any;
       pointLight: any;
       spotLight: any;
       hemisphereLight: any;
-      directionalLight: any;
-      fogExp2: any;
+      rectAreaLight: any;
+      group: any;
+      mesh: any;
+      primitive: any;
       fog: any;
       gridHelper: any;
+      
+      // Geometries
       boxGeometry: any;
       sphereGeometry: any;
       planeGeometry: any;
       cylinderGeometry: any;
-      coneGeometry: any;
-      circleGeometry: any;
-      ringGeometry: any;
       torusGeometry: any;
-      icosahedronGeometry: any;
+      ringGeometry: any;
+      circleGeometry: any;
       octahedronGeometry: any;
-      meshStandardMaterial: any;
+      icosahedronGeometry: any;
+      
+      // Materials
       meshBasicMaterial: any;
+      meshStandardMaterial: any;
       meshPhysicalMaterial: any;
-      color: any;
-      capsuleGeometry: any;
-      rectAreaLight: any;
+      
+      [elemName: string]: any;
     }
   }
 }
@@ -173,8 +170,24 @@ function DataStreamBackground({ themeColor }: { themeColor: string }) {
 }
 
 // -----------------------------
-// 4) ARCHITECTURAL LIGHTING (Luxury RectAreaLights)
+// 4) ARCHITECTURAL LIGHTING
 // -----------------------------
+// Helper to init RectAreaLightUniformsLib safely
+function LightingGlobals() {
+  useEffect(() => {
+    // Try standard import path
+    import("three/examples/jsm/lights/RectAreaLightUniformsLib.js")
+      .then((module) => module.RectAreaLightUniformsLib.init())
+      .catch(() => {
+        // Fallback import path
+        import("three/addons/lights/RectAreaLightUniformsLib.js")
+          .then((module) => module.RectAreaLightUniformsLib.init())
+          .catch(e => console.warn("RectAreaLight init failed", e));
+      });
+  }, []);
+  return null;
+}
+
 function ArchitecturalLights({ isGolden }: { isGolden: boolean }) {
   const lightColor = isGolden ? "#ffdfad" : "#e0f2fe";
   
@@ -526,32 +539,15 @@ function SeedCoreMonolith({ color }: { color: string }) {
 }
 
 // -----------------------------
-// 9) POST FX — optional + safe fallback
+// 9) POST FX
 // -----------------------------
 function PostFX({ enabled }: { enabled: boolean }) {
-  const { gl } = useThree();
-  const [ready, setReady] = useState(false);
+  // Directly render EffectComposer. 
+  // R3F handles context readiness better than arbitrary timeouts.
+  if (!enabled) return null;
 
-  useEffect(() => {
-    let t = 0;
-    if (!enabled) {
-      setReady(false);
-      return;
-    }
-    t = window.setTimeout(() => {
-      const ctx = gl.getContext();
-      if ((ctx as any)?.isContextLost?.() === true) return;
-      setReady(true);
-    }, 250);
-
-    return () => window.clearTimeout(t);
-  }, [enabled, gl]);
-
-  if (!ready) return null;
-
-  // Keep Bloom conservative for sandbox stability
   return (
-    <EffectComposer multisampling={0}>
+    <EffectComposer multisampling={0} enableNormalPass={false}>
       <Bloom luminanceThreshold={1.45} intensity={0.65} radius={0.22} mipmapBlur={false} levels={4} />
       <Noise opacity={0.035} />
       <Vignette eskil={false} offset={0.1} darkness={1.0} />
@@ -583,8 +579,9 @@ function useQualityManager(enabled: boolean, lockedSafe: boolean) {
 
   useEffect(() => {
     if (!enabled) return;
+    // Start at MEDIUM to avoid "incomplete" look on initial load, unless locked
     if (lockedSafe) setQuality("safe");
-    else setQuality("safe"); // start safe on enable
+    else setQuality("medium"); 
   }, [enabled, lockedSafe]);
 
   useFrame(() => {
@@ -660,35 +657,11 @@ export function VirtualRealityLayer({
   const [lockedSafe, setLockedSafe] = useState(false);
   const [postFxDisabled, setPostFxDisabled] = useState(false);
 
-  // Initialize RectAreaLightUniformsLib for luxury lighting
-  useEffect(() => {
-    if (enabled) {
-      import("three/examples/jsm/lights/RectAreaLightUniformsLib.js")
-        .then((module) => {
-          if (module.RectAreaLightUniformsLib) {
-            module.RectAreaLightUniformsLib.init();
-          }
-        })
-        .catch(() => {
-          // Try alternative path
-          import("three/addons/lights/RectAreaLightUniformsLib.js")
-            .then((module) => {
-              if (module.RectAreaLightUniformsLib) {
-                module.RectAreaLightUniformsLib.init();
-              }
-            })
-            .catch(() => {
-              // RectAreaLight may work without explicit init in some versions
-            });
-        });
-    }
-  }, [enabled]);
-
   // Quality + FPS (stable)
   // NOTE: useFrame inside hook requires Canvas, so we render a small child below to run the hook.
   // We'll store quality/fps in state via a bridge component.
 
-  const [quality, setQuality] = useState<Quality>("safe");
+  const [quality, setQuality] = useState<Quality>("medium");
   const [fps, setFps] = useState(60);
 
   const palette = useMemo(() => {
@@ -761,6 +734,9 @@ export function VirtualRealityLayer({
           };
         }}
       >
+        <LightingGlobals />
+        <Preload all />
+
         {/* Bridge: run quality hook inside Canvas and push to outer state */}
         <QualityBridge enabled={enabled} lockedSafe={lockedSafe} onUpdate={(q, f) => { setQuality(q); setFps(f); }} />
 
@@ -884,8 +860,6 @@ export function VirtualRealityLayer({
             opacity={quality === "high" ? 0.32 : 0.22}
             color="#fff"
             position={[0, 5, 0]}
-            depthWrite={false}
-            toneMapped={false}
           />
         </group>
 

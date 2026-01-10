@@ -5,34 +5,38 @@ import * as THREE from "three";
 import { Room, Agent, AgentRole } from "../types";
 import { GRID_WIDTH, GRID_HEIGHT } from "../constants";
 
-// Fix for missing R3F types in JSX
+// Fix: Add explicit declaration for JSX Intrinsic Elements to support React Three Fiber components
 declare global {
   namespace JSX {
     interface IntrinsicElements {
-      group: any;
-      mesh: any;
-      primitive: any;
       ambientLight: any;
       pointLight: any;
       spotLight: any;
       hemisphereLight: any;
-      directionalLight: any;
-      fogExp2: any;
+      rectAreaLight: any;
+      group: any;
+      mesh: any;
+      primitive: any;
+      fog: any;
       gridHelper: any;
+      
+      // Geometries
       boxGeometry: any;
       sphereGeometry: any;
       planeGeometry: any;
       cylinderGeometry: any;
-      coneGeometry: any;
-      circleGeometry: any;
-      ringGeometry: any;
       torusGeometry: any;
-      icosahedronGeometry: any;
+      ringGeometry: any;
+      circleGeometry: any;
       octahedronGeometry: any;
-      meshStandardMaterial: any;
+      icosahedronGeometry: any;
+      
+      // Materials
       meshBasicMaterial: any;
+      meshStandardMaterial: any;
       meshPhysicalMaterial: any;
-      color: any;
+      
+      // Removed duplicate index signature [elemName: string]: any; to avoid conflict with VirtualRealityLayer
     }
   }
 }
