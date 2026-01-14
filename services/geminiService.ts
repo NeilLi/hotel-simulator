@@ -108,6 +108,14 @@ export interface ToyDesignResult {
   } | null;
 }
 
+export interface EnvironmentAdaptationResult {
+  atmosphere: 'MORNING_LIGHT' | 'GOLDEN_HOUR' | 'EVENING_CHIC' | 'MIDNIGHT_LOUNGE';
+  temperature: number;
+  humidity: number;
+  aqi: number;
+  narrative: string;
+}
+
 class GeminiService {
   // Fix: Use gemini-3-pro-preview for complex reasoning and coding tasks as per guidelines
   private logicModel = "gemini-3-pro-preview";
@@ -421,6 +429,59 @@ class GeminiService {
     } catch (e) {
       console.error("Agent chat error", e);
       return "Communication protocols resetting...";
+    }
+  }
+
+  // --- ADAPTIVE ENVIRONMENT ---
+  async adaptEnvironment(roomName: string, currentAtmosphere: string, timeOfDay: number): Promise<EnvironmentAdaptationResult> {
+    const ai = this.getAI();
+    
+    const schema = {
+      type: Type.OBJECT,
+      properties: {
+        atmosphere: { type: Type.STRING, enum: ['MORNING_LIGHT', 'GOLDEN_HOUR', 'EVENING_CHIC', 'MIDNIGHT_LOUNGE'] },
+        temperature: { type: Type.NUMBER, description: "Target temperature in Celsius" },
+        humidity: { type: Type.NUMBER, description: "Target humidity percentage (0-100)" },
+        aqi: { type: Type.NUMBER, description: "Air Quality Index target" },
+        narrative: { type: Type.STRING, description: "Technical log of the adjustment logic" }
+      },
+      required: ['atmosphere', 'temperature', 'humidity', 'aqi', 'narrative']
+    };
+
+    const prompt = `
+    System: SeedCore Environmental Control.
+    Target Zone: ${roomName}.
+    Current Time: ${timeOfDay.toFixed(2)}.
+    Current State: ${currentAtmosphere}.
+    
+    Task: Calculate optimal environmental parameters for occupant comfort and energy efficiency based on the room type and time.
+    Output the new state configuration.
+    `;
+
+    try {
+      const response = await ai.models.generateContent({
+        model: this.fastModel,
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: schema,
+          temperature: 0.7
+        }
+      });
+
+      if (response.text) {
+        return JSON.parse(response.text) as EnvironmentAdaptationResult;
+      }
+      throw new Error("Empty response");
+    } catch (e) {
+      console.warn("Adaptation failed, using fallback.", e);
+      return {
+        atmosphere: 'EVENING_CHIC',
+        temperature: 21.5,
+        humidity: 45,
+        aqi: 15,
+        narrative: "Manual override engaged. Standard comfort protocols applied."
+      };
     }
   }
 

@@ -142,7 +142,7 @@ export const generateMap = (width: number, height: number) => {
       grid[connectorY+1][x] = EntityType.LOBBY_FLOOR;
   }
 
-  // --- 5. NORTH SERVICE SPINE (Back of House) ---
+  // --- 5. NORTH SERVICE SPINE (Back of House) ---x
   const serviceY = 2;
   const serviceH = 4;
   createBlock("SERVICE-N", "North Service Spine", 'SERVICE', WEST_WING_X, serviceY, (EAST_WING_X + WING_WIDTH) - WEST_WING_X, serviceH, EntityType.SERVICE_HUB);

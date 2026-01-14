@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Aperture, Map, Film, X, Activity, Clock, Power, Cpu, AlertTriangle, Layers, Terminal, Loader2, Thermometer, Wind, Lightbulb, Droplets } from 'lucide-react';
+import { Aperture, Map, Film, X, Activity, Clock, Power, Cpu, AlertTriangle, Layers, Terminal, Loader2, Thermometer, Wind, Lightbulb, Droplets, Sparkles, RefreshCw } from 'lucide-react';
 import { geminiService } from './services/geminiService';
 import { generateMap, generateAgents, updateAgentsLogic } from './utils/simulationUtils';
 import { EntityType, Room, Agent, SeedCoreState, SeedCorePlane } from './types';
@@ -71,8 +71,14 @@ const App: React.FC = () => {
   const [selectedRoom, setSelectedRoom] = useState<Room | null>(null);
   const [interactingAgentId, setInteractingAgentId] = useState<string | null>(null);
 
-  const [videoUrl, setVideoUrl] = useState<string | null>(null);
-  const [isVideoLoading, setIsVideoLoading] = useState(false);
+  // Environment State
+  const [isAdapting, setIsAdapting] = useState(false);
+  const [envMetrics, setEnvMetrics] = useState({
+     temperature: 22.4,
+     humidity: 45,
+     aqi: 12,
+     narrative: ""
+  });
   
   const [coreState, setCoreState] = useState<SeedCoreState>({
     activeAtmosphere: 'MORNING_LIGHT',
@@ -103,17 +109,29 @@ const App: React.FC = () => {
     return () => clearInterval(interval);
   }, [isInitialized, tick]);
 
-  const requestShot = async (desc: string) => {
-    if (!isAiEnabled) return;
-    setIsVideoLoading(true);
-    const result = await geminiService.generateCinematicShot(desc, coreState.activeAtmosphere);
-    if (result.url) {
-      setVideoUrl(result.url);
-    } else if (result.message) {
-      // Show error/limit message to user
-      alert(result.message);
+  const handleAdaptiveEnvironment = async () => {
+    if (!isAiEnabled || !selectedRoom) return;
+    setIsAdapting(true);
+    
+    try {
+        const result = await geminiService.adaptEnvironment(
+            selectedRoom.name, 
+            coreState.activeAtmosphere, 
+            coreState.timeOfDay
+        );
+
+        setCoreState(prev => ({ ...prev, activeAtmosphere: result.atmosphere }));
+        setEnvMetrics({
+            temperature: result.temperature,
+            humidity: result.humidity,
+            aqi: result.aqi,
+            narrative: result.narrative
+        });
+    } catch (e) {
+        console.error("Adaptation Error", e);
+    } finally {
+        setIsAdapting(false);
     }
-    setIsVideoLoading(false);
   };
 
   const getLightingStatus = (atmosphere: string) => {
@@ -178,7 +196,7 @@ const App: React.FC = () => {
              <div className="flex items-center gap-5 pointer-events-auto">
                 <div className="p-3 bg-cyan-500/10 rounded-xl border border-cyan-500/20"><Layers size={18} className="text-cyan-400"/></div>
                 <div>
-                    <h1 className="text-[11px] font-bold tracking-[0.4em] uppercase text-slate-100">SeedCore Director</h1>
+                    <h1 className="text--[11px] font-bold tracking-[0.4em] uppercase text-slate-100">SeedCore Director</h1>
                     <div className="text-[8px] text-cyan-500/40 font-mono tracking-widest uppercase mt-1">Plane: Topological • Grid: 80x44</div>
                 </div>
              </div>
@@ -243,7 +261,7 @@ const App: React.FC = () => {
                     <div className="p-3 bg-white/5 rounded-lg border border-white/5 flex items-center justify-between">
                         <div>
                             <span className="text-[8px] uppercase font-mono text-slate-500 block mb-1">Temp</span>
-                            <span className="text-[10px] font-mono text-amber-300 uppercase tracking-widest">22.4°C</span>
+                            <span className="text-[10px] font-mono text-amber-300 uppercase tracking-widest">{envMetrics.temperature}°C</span>
                         </div>
                         <Thermometer size={14} className="text-amber-500/50" />
                     </div>
@@ -252,7 +270,7 @@ const App: React.FC = () => {
                     <div className="p-3 bg-white/5 rounded-lg border border-white/5 flex items-center justify-between">
                         <div>
                             <span className="text-[8px] uppercase font-mono text-slate-500 block mb-1">Air Quality</span>
-                            <span className="text-[10px] font-mono text-emerald-300 uppercase tracking-widest">AQI 12 (Pure)</span>
+                            <span className="text-[10px] font-mono text-emerald-300 uppercase tracking-widest">AQI {envMetrics.aqi}</span>
                         </div>
                         <Wind size={14} className="text-emerald-500/50" />
                     </div>
@@ -270,38 +288,37 @@ const App: React.FC = () => {
                     <div className="p-3 bg-white/5 rounded-lg border border-white/5 flex items-center justify-between">
                         <div>
                             <span className="text-[8px] uppercase font-mono text-slate-500 block mb-1">Humidity</span>
-                            <span className="text-[10px] font-mono text-blue-300 uppercase tracking-widest">45%</span>
+                            <span className="text-[10px] font-mono text-blue-300 uppercase tracking-widest">{envMetrics.humidity}%</span>
                         </div>
                         <Droplets size={14} className="text-blue-500/50" />
                     </div>
                 </div>
 
+                {envMetrics.narrative && (
+                    <div className="mb-4 px-3 py-2 bg-emerald-500/10 border border-emerald-500/20 rounded-lg text-[9px] font-mono text-emerald-300 animate-in fade-in slide-in-from-bottom-2">
+                        <span className="font-bold mr-2">SYS.LOG:</span> {envMetrics.narrative}
+                    </div>
+                )}
+
                 <button 
-                    onClick={() => requestShot(`Holographic verification of ${selectedRoom.name}`)}
-                    disabled={!isAiEnabled}
+                    onClick={handleAdaptiveEnvironment}
+                    disabled={!isAiEnabled || isAdapting}
                     className={`w-full py-3 font-bold uppercase text-[9px] tracking-[0.3em] rounded-xl flex items-center justify-center gap-3 transition-all ${
-                      isAiEnabled ? 'bg-cyan-500 hover:bg-cyan-400 text-black shadow-lg shadow-cyan-500/20' : 'bg-slate-900 text-slate-600 cursor-not-allowed border border-slate-800'
+                      isAiEnabled && !isAdapting ? 'bg-cyan-500 hover:bg-cyan-400 text-black shadow-lg shadow-cyan-500/20' : 'bg-slate-900 text-slate-600 cursor-not-allowed border border-slate-800'
                     }`}
                 >
-                    <Film size={14} /> {isAiEnabled ? 'Request Neural Feed' : 'Core Offline'}
+                    {isAdapting ? (
+                        <>
+                           <Loader2 size={14} className="animate-spin" /> Calculating...
+                        </>
+                    ) : (
+                        <>
+                           <RefreshCw size={14} /> {isAiEnabled ? 'Adaptive Environment' : 'Core Offline'}
+                        </>
+                    )}
                 </button>
              </div>
           )}
-        </div>
-      )}
-
-      {/* VIDEO MODAL */}
-      {(videoUrl || isVideoLoading) && (
-        <div className="absolute inset-0 z-[60] bg-black/90 flex items-center justify-center p-8">
-            <div className="relative w-full max-w-4xl aspect-video bg-black border border-slate-800 shadow-2xl flex items-center justify-center rounded-2xl overflow-hidden">
-                 {isVideoLoading ? (
-                    <div className="flex flex-col items-center gap-4">
-                      <Loader2 size={32} className="animate-spin text-cyan-500" />
-                      <span className="text-[10px] font-mono text-cyan-500 uppercase tracking-widest">Compiling Scene...</span>
-                    </div>
-                 ) : <video src={videoUrl!} autoPlay controls loop className="w-full h-full object-cover" />}
-                 <button onClick={() => { setVideoUrl(null); setIsVideoLoading(false); }} className="absolute top-6 right-6 p-2 bg-black/50 rounded-full text-white hover:bg-white/20 transition-all"><X size={20}/></button>
-            </div>
         </div>
       )}
     </div>
