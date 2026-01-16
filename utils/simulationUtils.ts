@@ -1,5 +1,6 @@
 import { Room, Agent, AgentRole, EntityType, Coordinates } from "../types";
 import { GRID_WIDTH, GRID_HEIGHT } from "../constants";
+import { seedcoreService } from "../services/seedcoreService";
 
 // --- LAYOUT CONFIGURATION ---
 const WING_WIDTH = 20; // Width of side towers
@@ -297,4 +298,32 @@ export const updateAgentsLogic = (
 
     return { ...agent, position, previousPosition, target, state };
   });
+};
+
+/**
+ * Create a seedcore action task for a concierge ticket
+ */
+export const createSeedcoreActionTask = async (
+  ticketType: string,
+  room: string,
+  description?: string
+): Promise<void> => {
+  try {
+    const taskDescription = description || `${ticketType} for Room ${room}`;
+    
+    await seedcoreService.createTask({
+      type: "action",
+      description: taskDescription,
+      params: {
+        ticket_type: ticketType,
+        room: room,
+        domain: "hotel",
+        action: ticketType.toLowerCase().replace(/\s+/g, "_"),
+      },
+      run_immediately: true,
+    });
+  } catch (error) {
+    console.error("Failed to create seedcore action task:", error);
+    // Don't throw - allow ticket creation to continue even if seedcore fails
+  }
 };
