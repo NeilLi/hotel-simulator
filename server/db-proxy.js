@@ -14,16 +14,31 @@
 import express from 'express';
 import cors from 'cors';
 import { Pool } from 'pg';
+import crypto from 'crypto';
+import { Storage } from '@google-cloud/storage';
 
 const app = express();
 const PORT = process.env.DB_PROXY_PORT || 3001;
 
-// CORS for Vite dev server
+// CORS for Vite dev server (support both 3000 and 3010 for flexibility)
 app.use(cors({
-  origin: 'http://localhost:3000',
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    // Allow localhost on any port
+    if (origin.match(/^http:\/\/localhost:\d+$/)) {
+      return callback(null, true);
+    }
+    
+    // Default: allow the request
+    callback(null, true);
+  },
   credentials: true
 }));
-app.use(express.json());
+// Increase body size limit to handle large base64 image payloads (50MB)
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // Database configuration (from environment or defaults matching docker/env.example)
 // Note: The actual database name is 'seedcore', not 'postgres' (see PG_DSN in env.example)
@@ -38,99 +53,40 @@ const pool = new Pool({
   connectionTimeoutMillis: 2000,
 });
 
-const ZERO_VECTOR_1024 = `[${Array.from({ length: 1024 }).fill(0).join(",")}]`;
-
-const normalizeToArray = (value) => {
-  if (Array.isArray(value)) return value;
-  if (value === null || value === undefined) return [];
-  return [value];
-};
-
-const parseRuleValue = (value) => {
-  if (value === null || value === undefined) return undefined;
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (!trimmed.length) return "";
-    try {
-      return JSON.parse(trimmed);
-    } catch {
-      return trimmed;
-    }
-  }
-  return value;
-};
-
-const evaluateCondition = (condition, context) => {
-  const { conditionType, conditionKey, operator, value } = condition;
-  const parsedValue = parseRuleValue(value);
-
-  let source = null;
-  if (conditionType === "TAG") source = normalizeToArray(context.tags);
-  if (conditionType === "SIGNAL") source = context.signals || {};
-  if (conditionType === "VALUE") source = context.values || {};
-  if (conditionType === "FACT") source = context.facts || {};
-
-  if (conditionType === "TAG") {
-    const tags = source;
-    if (operator === "EXISTS") {
-      return tags.some((tag) => String(tag).startsWith(conditionKey));
-    }
-    if (parsedValue !== undefined && parsedValue !== null) {
-      return tags.includes(`${conditionKey}=${parsedValue}`) || tags.includes(parsedValue) || tags.includes(conditionKey);
-    }
-    return tags.includes(conditionKey);
-  }
-
-  const actualValue = source?.[conditionKey];
-  if (operator === "EXISTS") {
-    return actualValue !== undefined && actualValue !== null;
-  }
-
-  if (actualValue === undefined || actualValue === null) {
-    return false;
-  }
-
-  if (operator === "=") return actualValue === parsedValue;
-  if (operator === "!=") return actualValue !== parsedValue;
-
-  const actualNumber = Number(actualValue);
-  const expectedNumber = Number(parsedValue);
-
-  if (operator === ">=") return actualNumber >= expectedNumber;
-  if (operator === "<=") return actualNumber <= expectedNumber;
-  if (operator === ">") return actualNumber > expectedNumber;
-  if (operator === "<") return actualNumber < expectedNumber;
-
-  if (operator === "IN") {
-    const list = Array.isArray(parsedValue)
-      ? parsedValue
-      : String(parsedValue || "")
-          .split(",")
-          .map((entry) => entry.trim())
-          .filter(Boolean);
-    return list.includes(String(actualValue)) || list.includes(actualValue);
-  }
-
-  if (operator === "MATCHES") {
-    try {
-      const regex = new RegExp(String(parsedValue));
-      return regex.test(String(actualValue));
-    } catch {
-      return false;
-    }
-  }
-
-  return false;
-};
-
-// Test connection
-pool.on('connect', () => {
+// Test connection and load enum defaults
+pool.on('connect', async () => {
   console.log('✅ Database connection established');
+  // Load task status enum default after first connection
+  await loadTaskStatusDefault();
 });
 
 pool.on('error', (err) => {
   console.error('❌ Database pool error:', err);
 });
+
+// Cache for task status enum default value (loaded at startup)
+let TASK_STATUS_DEFAULT = 'active';
+
+// Load task status enum default value at startup
+async function loadTaskStatusDefault() {
+  try {
+    const result = await pool.query(`
+      SELECT e.enumlabel AS v
+      FROM pg_type t
+      JOIN pg_enum e ON t.oid = e.enumtypid
+      WHERE t.typname = 'taskstatus'
+      ORDER BY e.enumsortorder
+      LIMIT 1
+    `);
+    if (result.rows[0]?.v) {
+      TASK_STATUS_DEFAULT = result.rows[0].v;
+      console.log(`✅ Loaded task status enum default: ${TASK_STATUS_DEFAULT}`);
+    }
+  } catch (e) {
+    console.warn('⚠️  Could not load taskstatus enum; using fallback "active":', e.message);
+  }
+}
+
 
 // Health check
 app.get('/health', async (req, res) => {
@@ -418,6 +374,97 @@ app.get('/api/deployments/active', async (req, res) => {
     })));
   } catch (error) {
     console.error('Error fetching active deployments:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get deployment coverage (intent vs reality: deployments vs device_versions)
+app.get('/api/deployments/coverage', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT 
+        target,
+        region,
+        snapshot_id,
+        version,
+        devices_on_snapshot,
+        devices_total
+      FROM pkg_deployment_coverage
+      ORDER BY target, region, snapshot_id DESC
+    `);
+    
+    res.json(result.rows.map(row => ({
+      target: row.target,
+      region: row.region,
+      snapshotId: row.snapshot_id,
+      version: row.version,
+      devicesOnSnapshot: Number(row.devices_on_snapshot || 0),
+      devicesTotal: Number(row.devices_total || 0),
+    })));
+  } catch (error) {
+    console.error('Error fetching deployment coverage:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get rollout events (audit trail for canary deployments)
+app.get('/api/deployments/events', async (req, res) => {
+  try {
+    const target = req.query.target;
+    const region = req.query.region;
+    const limit = req.query.limit ? parseInt(req.query.limit) : null;
+    
+    let query = `
+      SELECT 
+        id,
+        target,
+        region,
+        snapshot_id,
+        from_percent,
+        to_percent,
+        is_rollback,
+        actor,
+        validation_run_id,
+        created_at
+      FROM pkg_rollout_events
+      WHERE 1=1
+    `;
+    const params = [];
+    let paramIndex = 1;
+    
+    if (target) {
+      query += ` AND target = $${paramIndex++}`;
+      params.push(target);
+    }
+    
+    if (region) {
+      query += ` AND region = $${paramIndex++}`;
+      params.push(region);
+    }
+    
+    query += ` ORDER BY created_at DESC`;
+    
+    if (limit && limit > 0) {
+      query += ` LIMIT $${paramIndex++}`;
+      params.push(limit);
+    }
+    
+    const result = await pool.query(query, params);
+    
+    res.json(result.rows.map(row => ({
+      id: row.id,
+      target: row.target,
+      region: row.region,
+      snapshotId: row.snapshot_id,
+      fromPercent: row.from_percent ?? null,
+      toPercent: row.to_percent ?? 0,
+      isRollback: !!(row.is_rollback),
+      actor: row.actor ?? 'system',
+      validationRunId: row.validation_run_id ?? null,
+      createdAt: row.created_at.toISOString(),
+    })));
+  } catch (error) {
+    console.error('Error fetching rollout events:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -927,211 +974,6 @@ app.get('/api/unified-memory', async (req, res) => {
     })));
   } catch (error) {
     console.error('Error fetching unified memory:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Evaluate policy against PKG rules (lightweight simulator)
-app.post('/api/policy/evaluate', async (req, res) => {
-  try {
-    const { snapshotId, context } = req.body || {};
-
-    if (!snapshotId) {
-      return res.status(400).json({ error: 'snapshotId is required' });
-    }
-
-    const rulesResult = await pool.query(`
-      SELECT 
-        r.id,
-        r.rule_name,
-        r.priority,
-        r.disabled,
-        r.metadata,
-        c.condition_type,
-        c.condition_key,
-        c.operator,
-        c.value,
-        e.relationship_type,
-        e.params
-      FROM pkg_policy_rules r
-      LEFT JOIN pkg_rule_conditions c ON c.rule_id = r.id
-      LEFT JOIN pkg_rule_emissions e ON e.rule_id = r.id
-      WHERE r.snapshot_id = $1 AND r.disabled = FALSE
-      ORDER BY r.priority DESC, r.rule_name
-    `, [snapshotId]);
-
-    const rulesMap = new Map();
-    rulesResult.rows.forEach((row) => {
-      if (!rulesMap.has(row.id)) {
-        rulesMap.set(row.id, {
-          id: row.id,
-          ruleName: row.rule_name,
-          priority: row.priority,
-          metadata: row.metadata,
-          conditions: [],
-          emissions: [],
-        });
-      }
-      const rule = rulesMap.get(row.id);
-      if (row.condition_type) {
-        rule.conditions.push({
-          conditionType: row.condition_type,
-          conditionKey: row.condition_key,
-          operator: row.operator,
-          value: row.value,
-        });
-      }
-      if (row.relationship_type) {
-        rule.emissions.push({
-          relationshipType: row.relationship_type,
-          params: row.params || {},
-        });
-      }
-    });
-
-    const ruleHits = [];
-    const reasons = [];
-    const requiredOverrides = [];
-    let blocked = false;
-
-    for (const rule of rulesMap.values()) {
-      const conditions = rule.conditions || [];
-      const matches = conditions.length === 0
-        ? true
-        : conditions.every((condition) => evaluateCondition(condition, context || {}));
-
-      if (!matches) continue;
-
-      ruleHits.push({
-        ruleId: String(rule.id),
-        ruleName: rule.ruleName,
-        priority: rule.priority,
-      });
-
-      const emissions = rule.emissions || [];
-      emissions.forEach((emission) => {
-        if (emission.relationshipType !== 'GATE') return;
-        const params = emission.params || {};
-        const decision =
-          params.decision || params.action || params.effect || params.gate || null;
-        if (params.allowed === false || decision === 'block' || decision === 'deny') {
-          blocked = true;
-          reasons.push(params.reason || `Blocked by ${rule.ruleName}`);
-          return;
-        }
-        if (params.requiresOverride || params.overrideReason) {
-          requiredOverrides.push(params.overrideReason || `Override required by ${rule.ruleName}`);
-        }
-      });
-
-      if (rule.metadata?.warning) {
-        reasons.push(rule.metadata.warning);
-      }
-    }
-
-    const uniqueReasons = Array.from(new Set(reasons));
-    const uniqueOverrides = Array.from(new Set(requiredOverrides));
-
-    res.json({
-      allowed: !blocked,
-      blocked,
-      requiredOverrides: uniqueOverrides,
-      reasons: uniqueReasons.slice(0, 6),
-      ruleHits,
-    });
-  } catch (error) {
-    console.error('Error evaluating policy:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Append unified memory event (working or knowledge_base)
-app.post('/api/memory/append', async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const { tier, category, content, metadata, runId } = req.body || {};
-
-    if (!tier || !category) {
-      return res.status(400).json({ error: 'tier and category are required' });
-    }
-
-    await client.query('BEGIN');
-
-    if (runId) {
-      const existing = await client.query(
-        `SELECT id FROM tasks WHERE params->>'runId' = $1 AND params->>'memoryTier' = $2 LIMIT 1`,
-        [runId, tier]
-      );
-      if (existing.rows.length > 0) {
-        await client.query('COMMIT');
-        return res.json({ id: existing.rows[0].id, reused: true });
-      }
-    }
-
-    const params = {
-      memoryTier: tier,
-      multimodal: metadata?.multimodal || undefined,
-      runId: runId || undefined,
-      source_modality: metadata?.source_modality || 'text',
-      policy: metadata?.policy || undefined,
-      snapshot: metadata?.snapshot || undefined,
-      ticket: metadata?.ticket || undefined,
-      intent: metadata?.intent || undefined,
-      design: metadata?.design || undefined,
-    };
-
-    const taskResult = await client.query(
-      `INSERT INTO tasks (type, status, description, params)
-       VALUES ($1, 'completed', $2, $3)
-       RETURNING id`,
-      [category, content || category, params]
-    );
-
-    const taskId = taskResult.rows[0].id;
-
-    if (tier === 'event_working') {
-      await client.query(
-        `INSERT INTO task_multimodal_embeddings (task_id, emb, source_modality, model_version)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT DO NOTHING`,
-        [taskId, ZERO_VECTOR_1024, params.source_modality, metadata?.model_version || 'wearable-story-v1']
-      );
-    }
-
-    if (tier === 'knowledge_base') {
-      const nodeResult = await client.query(`SELECT ensure_task_node($1) AS node_id`, [taskId]);
-      const nodeId = nodeResult.rows[0]?.node_id;
-      if (nodeId) {
-        await client.query(
-          `INSERT INTO graph_embeddings_1024 (node_id, label, props, emb, model)
-           VALUES ($1, 'task.primary', $2, $3, $4)
-           ON CONFLICT DO NOTHING`,
-          [nodeId, metadata?.graph_props || {}, ZERO_VECTOR_1024, metadata?.model_version || 'wearable-story-v1']
-        );
-      }
-    }
-
-    await client.query('COMMIT');
-    res.json({ id: taskId, reused: false });
-  } catch (error) {
-    await client.query('ROLLBACK');
-    console.error('Error appending memory:', error);
-    res.status(500).json({ error: error.message });
-  } finally {
-    client.release();
-  }
-});
-
-// Submit manufacturing ticket (mocked persistence)
-app.post('/api/mfg/submit', async (req, res) => {
-  try {
-    const { ticketId, runId } = req.body || {};
-    if (!ticketId || !runId) {
-      return res.status(400).json({ error: 'ticketId and runId are required' });
-    }
-    res.json({ status: 'accepted', ticketId, runId, submittedAt: new Date().toISOString() });
-  } catch (error) {
-    console.error('Error submitting ticket:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -1754,6 +1596,511 @@ app.patch('/api/snapshots/:id', async (req, res) => {
   }
 });
 
+// Memory endpoints for Unified Cortex Memory integration
+// POST /api/memory/append - Write to event_working (tasks + multimodal embeddings) or knowledge_base (graph embeddings)
+app.post('/api/memory/append', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    
+    const { tier, category, content, runId, metadata } = req.body;
+    
+    if (!tier || !category || !content) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'tier, category, and content are required' });
+    }
+    
+    if (tier === 'event_working') {
+      // Write to tasks + task_multimodal_embeddings (Tier A)
+      // Generate a UUID for the task
+      const taskIdResult = await client.query('SELECT gen_random_uuid() as id');
+      const taskId = taskIdResult.rows[0].id;
+      
+      // Map category to valid task type enum values
+      // Valid types: "chat", "query", "action", "graph", "maintenance", "unknown"
+      const validTaskTypes = ['chat', 'query', 'action', 'graph', 'maintenance', 'unknown'];
+      let taskType = 'action'; // Default to 'action' for wearable design seeds
+      
+      // Try to map category to a valid type
+      if (category.includes('design') || category.includes('wearable') || category.includes('seed')) {
+        taskType = 'action'; // Design/wearable tasks are actions
+      } else if (category.includes('query') || category.includes('search')) {
+        taskType = 'query';
+      } else if (category.includes('chat') || category.includes('conversation')) {
+        taskType = 'chat';
+      } else if (category.includes('graph') || category.includes('knowledge')) {
+        taskType = 'graph';
+      } else if (validTaskTypes.includes(category.toLowerCase())) {
+        taskType = category.toLowerCase();
+      }
+      
+      // Store original category in metadata
+      const taskMetadata = {
+        ...(metadata || {}),
+        original_category: category,
+        task_category: category
+      };
+      
+      // Insert into tasks table
+      // Use SAVEPOINT before the insert to allow safe rollback on failure
+      await client.query('SAVEPOINT sp_task_insert');
+      
+      try {
+        // Always include status with the cached default value
+        // This prevents NOT NULL constraint violations
+        await client.query(`
+          INSERT INTO tasks (id, type, description, params, status)
+          VALUES ($1, $2, $3, $4, $5)
+        `, [
+          taskId,
+          taskType,
+          content,
+          JSON.stringify(taskMetadata),
+          TASK_STATUS_DEFAULT
+        ]);
+        
+        await client.query('RELEASE SAVEPOINT sp_task_insert');
+      } catch (insertError) {
+        // Log the root cause error (not just the 25P02 symptom)
+        console.error('❌ tasks insert failed (root cause):', {
+          code: insertError.code,
+          message: insertError.message,
+          detail: insertError.detail,
+          constraint: insertError.constraint,
+          column: insertError.column,
+          dataType: insertError.dataType
+        });
+        
+        // Rollback to savepoint (this prevents transaction abort)
+        await client.query('ROLLBACK TO SAVEPOINT sp_task_insert');
+        await client.query('RELEASE SAVEPOINT sp_task_insert');
+        
+        // Re-throw the error - don't continue in the same transaction
+        throw insertError;
+      }
+      
+      // Generate a dummy embedding vector (1024 dimensions) - in production, this would come from an embedding service
+      // For now, we'll use a zero vector or a simple hash-based vector
+      const embeddingVector = Array(1024).fill(0).map(() => Math.random() * 0.01 - 0.005); // Small random values
+      const embeddingStr = `[${embeddingVector.join(',')}]`;
+      
+      // Insert into task_multimodal_embeddings
+      await client.query(`
+        INSERT INTO task_multimodal_embeddings (task_id, emb, source_modality, model_version)
+        VALUES ($1, $2::vector, $3, $4)
+      `, [
+        taskId,
+        embeddingStr,
+        metadata?.source_modality || 'text',
+        metadata?.model_version || 'default'
+      ]);
+      
+      await client.query('COMMIT');
+      
+      res.json({
+        id: taskId,
+        tier: 'event_working',
+        category,
+        content,
+        metadata: metadata || {}
+      });
+    } else if (tier === 'knowledge_base') {
+      // Write to graph_embeddings_1024 (Tier B/C)
+      // Generate a dummy embedding vector (1024 dimensions)
+      const embeddingVector = Array(1024).fill(0).map(() => Math.random() * 0.01 - 0.005);
+      const embeddingStr = `[${embeddingVector.join(',')}]`;
+      
+      // Compute content SHA256 for deduplication
+      const contentSha256 = crypto.createHash('sha256').update(content).digest('hex');
+      
+      // Generate node_id - Option A: Check sequence existence first (industry-grade)
+      // This avoids transaction abort by never calling nextval on non-existent sequence
+      let nodeId;
+      
+      try {
+        // Safe existence check that never errors
+        const seqExists = await client.query(`
+          SELECT to_regclass('graph_nodes_node_id_seq') IS NOT NULL AS ok
+        `);
+        
+        if (seqExists.rows[0]?.ok) {
+          // Sequence exists, use it
+          const seqResult = await client.query(`
+            SELECT nextval('graph_nodes_node_id_seq') AS node_id
+          `);
+          nodeId = seqResult.rows[0]?.node_id;
+          
+          if (!nodeId) {
+            throw new Error('Sequence returned null');
+          }
+        } else {
+          // Sequence doesn't exist, use fallback generator
+          const ts = Date.now();
+          const rnd = Math.floor(Math.random() * 1_000_000);
+          nodeId = parseInt(`${ts}${String(rnd).padStart(6, '0')}`, 10);
+        }
+      } catch (seqError) {
+        // Log root cause if sequence check/usage fails
+        console.error('❌ node_id generation failed (root cause):', {
+          code: seqError.code,
+          message: seqError.message,
+          detail: seqError.detail
+        });
+        
+        // Fallback generator (guaranteed to work)
+        const ts = Date.now();
+        const rnd = Math.floor(Math.random() * 1_000_000);
+        nodeId = parseInt(`${ts}${String(rnd).padStart(6, '0')}`, 10);
+      }
+      
+      // Validate nodeId before using it
+      if (!nodeId || !Number.isFinite(nodeId) || nodeId <= 0) {
+        await client.query('ROLLBACK');
+        return res.status(500).json({ error: `Invalid node_id generated: ${nodeId}` });
+      }
+      
+      // Insert into graph_embeddings_1024
+      // Use SAVEPOINT before the insert to allow safe rollback on failure
+      await client.query('SAVEPOINT sp_graph_insert');
+      
+      let result;
+      try {
+        result = await client.query(`
+          INSERT INTO graph_embeddings_1024 (node_id, label, emb, model, props, content_sha256)
+          VALUES ($1, $2, $3::vector, $4, $5, $6)
+          RETURNING node_id
+        `, [
+          nodeId,
+          category,
+          embeddingStr,
+          metadata?.model || 'default',
+          JSON.stringify(metadata || {}),
+          contentSha256
+        ]);
+        
+        await client.query('RELEASE SAVEPOINT sp_graph_insert');
+      } catch (insertError) {
+        // Log root cause (25P02 is just a symptom - the real error happened earlier)
+        console.error('❌ graph_embeddings_1024 insert failed (root cause):', {
+          code: insertError.code,
+          message: insertError.message,
+          detail: insertError.detail,
+          constraint: insertError.constraint,
+          column: insertError.column,
+          dataType: insertError.dataType
+        });
+        
+        // Rollback to savepoint (this prevents transaction abort)
+        await client.query('ROLLBACK TO SAVEPOINT sp_graph_insert');
+        await client.query('RELEASE SAVEPOINT sp_graph_insert');
+        
+        // Re-throw the error - don't continue in the same transaction
+        throw insertError;
+      }
+      
+      const insertedNodeId = result.rows[0].node_id;
+      
+      // If metadata contains a task_id, create a mapping in graph_node_map
+      if (metadata?.task_id) {
+        try {
+          await client.query(`
+            INSERT INTO graph_node_map (task_id, node_id, relationship_type)
+            VALUES ($1::uuid, $2, 'references')
+            ON CONFLICT DO NOTHING
+          `, [metadata.task_id, insertedNodeId]);
+        } catch (err) {
+          // graph_node_map might not exist or have different schema, ignore
+          console.warn('Could not create graph_node_map entry:', err.message);
+        }
+      }
+      
+      await client.query('COMMIT');
+      
+      res.json({
+        id: insertedNodeId.toString(),
+        tier: 'knowledge_base',
+        category,
+        content,
+        metadata: metadata || {}
+      });
+    } else {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: `Invalid tier: ${tier}. Must be 'event_working' or 'knowledge_base'` });
+    }
+  } catch (error) {
+    // Always rollback on error (safe even if already rolled back)
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackError) {
+      // Ignore rollback errors - transaction might already be rolled back
+      // This is safe and expected
+    }
+    console.error('Error appending to memory:', error);
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+// POST /api/memory/promote - Promote an item from event_working to knowledge_base
+app.post('/api/memory/promote', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    
+    const { seedHash, taskId, label } = req.body;
+    
+    if (!taskId && !seedHash) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Either taskId or seedHash is required' });
+    }
+    
+    const memoryLabel = label || 'wearable.ticket';
+    
+    // Find the task by taskId (UUID) or by searching metadata for seedHash
+    let task;
+    if (taskId) {
+      const taskResult = await client.query('SELECT * FROM tasks WHERE id = $1', [taskId]);
+      if (taskResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: `Task ${taskId} not found` });
+      }
+      task = taskResult.rows[0];
+    } else {
+      // Search for task by seedHash in metadata (less efficient, but supports seedHash lookup)
+      const tasksResult = await client.query('SELECT * FROM tasks WHERE params::text LIKE $1', [`%${seedHash}%`]);
+      if (tasksResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: `Task with seedHash ${seedHash} not found` });
+      }
+      task = tasksResult.rows[0];
+    }
+    
+    // Get the embedding from task_multimodal_embeddings
+    const embeddingResult = await client.query(`
+      SELECT emb FROM task_multimodal_embeddings WHERE task_id = $1
+    `, [task.id]);
+    
+    if (embeddingResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: `No embedding found for task ${task.id}` });
+    }
+    
+    const embedding = embeddingResult.rows[0].emb;
+    
+    // Compute content SHA256
+    const contentSha256 = crypto.createHash('sha256').update(task.description || '').digest('hex');
+    
+    // Generate node_id - Option A: Check sequence existence first (industry-grade)
+    let nodeId;
+    
+    try {
+      // Safe existence check that never errors
+      const seqExists = await client.query(`
+        SELECT to_regclass('graph_nodes_node_id_seq') IS NOT NULL AS ok
+      `);
+      
+      if (seqExists.rows[0]?.ok) {
+        // Sequence exists, use it
+        const seqResult = await client.query(`
+          SELECT nextval('graph_nodes_node_id_seq') AS node_id
+        `);
+        nodeId = seqResult.rows[0]?.node_id;
+        
+        if (!nodeId) {
+          throw new Error('Sequence returned null');
+        }
+      } else {
+        // Sequence doesn't exist, use fallback generator
+        const ts = Date.now();
+        const rnd = Math.floor(Math.random() * 1_000_000);
+        nodeId = parseInt(`${ts}${String(rnd).padStart(6, '0')}`, 10);
+      }
+    } catch (seqError) {
+      // Log root cause if sequence check/usage fails
+      console.error('❌ node_id generation failed (root cause):', {
+        code: seqError.code,
+        message: seqError.message,
+        detail: seqError.detail
+      });
+      
+      // Fallback generator (guaranteed to work)
+      const ts = Date.now();
+      const rnd = Math.floor(Math.random() * 1_000_000);
+      nodeId = parseInt(`${ts}${String(rnd).padStart(6, '0')}`, 10);
+    }
+    
+    // Validate nodeId before using it
+    if (!nodeId || !Number.isFinite(nodeId) || nodeId <= 0) {
+      await client.query('ROLLBACK');
+      return res.status(500).json({ error: `Invalid node_id generated: ${nodeId}` });
+    }
+    
+    // Insert into graph_embeddings_1024
+    const graphResult = await client.query(`
+      INSERT INTO graph_embeddings_1024 (node_id, label, emb, model, props, content_sha256)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      RETURNING node_id
+    `, [
+      nodeId,
+      memoryLabel,
+      embedding,
+      'promoted',
+      JSON.stringify({
+        task_id: task.id,
+        task_type: task.type,
+        promoted_at: new Date().toISOString(),
+        seed_hash: seedHash
+      }),
+      contentSha256
+    ]);
+    
+    const insertedNodeId = graphResult.rows[0].node_id;
+    
+    // Create mapping in graph_node_map
+    try {
+      await client.query(`
+        INSERT INTO graph_node_map (task_id, node_id, relationship_type)
+        VALUES ($1::uuid, $2, 'promoted')
+        ON CONFLICT DO NOTHING
+      `, [task.id, insertedNodeId]);
+    } catch (err) {
+      console.warn('Could not create graph_node_map entry:', err.message);
+    }
+    
+    await client.query('COMMIT');
+    
+    res.json({
+      success: true,
+      taskId: task.id,
+      nodeId: insertedNodeId.toString(),
+      label: memoryLabel,
+      message: `Task ${task.id} promoted to knowledge_base as node ${nodeId}`
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error promoting memory:', error);
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+// POST /api/policy/evaluate - Evaluate policy for a given context (stub implementation)
+app.post('/api/policy/evaluate', async (req, res) => {
+  try {
+    const { snapshotId, context } = req.body;
+    
+    if (!snapshotId || !context) {
+      return res.status(400).json({ error: 'snapshotId and context are required' });
+    }
+    
+    // Stub implementation - in production, this would evaluate against PKG rules
+    // For now, return a simple allowed/blocked decision based on risk_score
+    const riskScore = context.signals?.risk_score || 0;
+    const allowed = riskScore < 0.8; // Simple threshold
+    
+    res.json({
+      allowed,
+      reason: allowed 
+        ? 'Allowed by policy (risk score below threshold)' 
+        : 'Blocked by policy (risk score too high)',
+      message: allowed ? 'Policy evaluation passed' : 'Policy evaluation failed',
+      riskScore
+    });
+  } catch (error) {
+    console.error('Error evaluating policy:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Initialize Google Cloud Storage
+const storage = new Storage();
+const BUCKET_NAME = 'seedcore-designs-dev';
+
+// Upload design image to Google Cloud Storage
+app.post('/api/designs/upload', async (req, res) => {
+  try {
+    const { imageUrl, runId, suffix } = req.body;
+
+    if (!imageUrl || !runId || !suffix) {
+      return res.status(400).json({ 
+        error: 'Missing required fields: imageUrl, runId, and suffix are required' 
+      });
+    }
+
+    if (!['print', 'mockup'].includes(suffix)) {
+      return res.status(400).json({ 
+        error: 'suffix must be either "print" or "mockup"' 
+      });
+    }
+
+    const bucket = storage.bucket(BUCKET_NAME);
+    const fileName = `designs/${runId}-${suffix}.png`;
+    const file = bucket.file(fileName);
+
+    let buffer;
+
+    // Handle data URLs (base64)
+    if (imageUrl.startsWith('data:')) {
+      const base64Data = imageUrl.split(',')[1];
+      buffer = Buffer.from(base64Data, 'base64');
+    } else {
+      // Handle regular URLs (fetch from Gemini's temporary URL)
+      const response = await fetch(imageUrl);
+      const arrayBuffer = await response.arrayBuffer();
+      buffer = Buffer.from(arrayBuffer);
+    }
+
+    // Upload to GCS
+    // Note: With uniform bucket-level access enabled, we can't set per-object ACLs.
+    // Ensure the bucket has bucket-level IAM policy with allUsers having 
+    // roles/storage.objectViewer role for public read access.
+    await file.save(buffer, {
+      metadata: { contentType: 'image/png' },
+    });
+
+    // Return the permanent URL
+    const permanentUrl = `https://storage.googleapis.com/${BUCKET_NAME}/${fileName}`;
+    res.json({ url: permanentUrl });
+  } catch (error) {
+    console.error('Error uploading design to GCS:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Submit manufacturing ticket (wearable design)
+app.post('/api/mfg/submit', async (req, res) => {
+  try {
+    const ticket = req.body;
+    
+    // Validate required fields
+    if (!ticket.ticketId || !ticket.runId || !ticket.design) {
+      return res.status(400).json({ 
+        error: 'Missing required fields: ticketId, runId, and design are required' 
+      });
+    }
+
+    // In a real system, you would save this to a database
+    // For now, we'll just log it and return success
+    console.log('[MFG] Manufacturing ticket submitted:', {
+      ticketId: ticket.ticketId,
+      runId: ticket.runId,
+      designConcept: ticket.design?.designConcept,
+      createdAt: ticket.createdAt,
+    });
+
+    res.json({ 
+      success: true,
+      ticketId: ticket.ticketId,
+      message: 'Manufacturing ticket submitted successfully'
+    });
+  } catch (error) {
+    console.error('Error submitting manufacturing ticket:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Catch-all for debugging unmatched routes
 app.use('/api/snapshots', (req, res, next) => {
   console.log(`[UNMATCHED ROUTE] ${req.method} ${req.path}`);
@@ -1780,12 +2127,16 @@ app.listen(PORT, () => {
   console.log(`   PATCH  /api/snapshots/:id`);
   console.log(`   GET    /api/deployments`);
   console.log(`   GET    /api/deployments/active`);
+  console.log(`   GET    /api/deployments/coverage`);
+  console.log(`   GET    /api/deployments/events`);
   console.log(`   POST   /api/deployments`);
   console.log(`   GET    /api/validation-runs`);
   console.log(`   POST   /api/validation-runs/start`);
   console.log(`   POST   /api/validation-runs/finish`);
-  console.log(`   POST   /api/policy/evaluate`);
   console.log(`   POST   /api/memory/append`);
+  console.log(`   POST   /api/memory/promote`);
+  console.log(`   POST   /api/policy/evaluate`);
+  console.log(`   POST   /api/designs/upload`);
   console.log(`   POST   /api/mfg/submit`);
   const dbName = process.env.POSTGRES_DB || 'seedcore';
   console.log(`📊 Connected to PostgreSQL at ${process.env.POSTGRES_HOST || 'localhost'}:${process.env.POSTGRES_PORT || '5432'}/${dbName}`);

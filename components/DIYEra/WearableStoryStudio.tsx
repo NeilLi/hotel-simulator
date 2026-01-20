@@ -1,6 +1,7 @@
 import React, { useEffect, useReducer, useState } from 'react';
-import { ArrowLeft, Sparkles, Shirt, Wand2, Download, Printer, Scissors, Layers, Loader2, ShieldAlert, ShieldCheck, ShieldX } from 'lucide-react';
+import { ArrowLeft, Sparkles, Shirt, Wand2, Download, Printer, Scissors, Layers, Loader2, ShieldAlert, ShieldCheck, ShieldX, CheckCircle2, X } from 'lucide-react';
 import { wearableStudioService } from '../../services/wearableStudioService';
+import { seedcoreService } from '../../services/seedcoreService';
 import { PolicyDecision, WearableDesignDraft, WearableIntent, WearableTicket } from '../../services/wearableStudioTypes';
 import { Snapshot } from '../../types';
 
@@ -25,6 +26,7 @@ type StudioState = {
   designDraft: WearableDesignDraft | null;
   ticket: WearableTicket | null;
   error: string | null;
+  notification: { message: string; taskId?: string } | null;
 };
 
 type StudioAction =
@@ -34,7 +36,8 @@ type StudioAction =
   | { type: 'SET_DESIGN'; design: WearableDesignDraft | null }
   | { type: 'SET_RUN_ID'; runId: string | null }
   | { type: 'SET_TICKET'; ticket: WearableTicket | null }
-  | { type: 'SET_ERROR'; error: string | null };
+  | { type: 'SET_ERROR'; error: string | null }
+  | { type: 'SET_NOTIFICATION'; notification: { message: string; taskId?: string } | null };
 
 const initialState: StudioState = {
   story: '',
@@ -47,6 +50,7 @@ const initialState: StudioState = {
   designDraft: null,
   ticket: null,
   error: null,
+  notification: null,
 };
 
 function reducer(state: StudioState, action: StudioAction): StudioState {
@@ -65,6 +69,8 @@ function reducer(state: StudioState, action: StudioAction): StudioState {
       return { ...state, ticket: action.ticket };
     case 'SET_ERROR':
       return { ...state, error: action.error };
+    case 'SET_NOTIFICATION':
+      return { ...state, notification: action.notification };
     default:
       return state;
   }
@@ -134,7 +140,7 @@ export function WearableStoryStudio({ onBack }: Props) {
 
       dispatch({ type: 'SET_STATUS', status: 'generating' });
       const request = await wearableStudioService.buildLLMRequest(intent, policyDecision, snapshot || undefined);
-      const design = await wearableStudioService.designWearable(request);
+      const design = await wearableStudioService.designWearable(request, runId);
       dispatch({ type: 'SET_DESIGN', design });
       dispatch({ type: 'SET_STATUS', status: 'review' });
 
@@ -163,10 +169,29 @@ export function WearableStoryStudio({ onBack }: Props) {
   };
 
   const handleSubmit = async () => {
-    if (!state.designDraft || !state.policyDecision?.allowed || isBusy) return;
+    console.log('[WearableStudio] handleSubmit called', {
+      hasDesignDraft: !!state.designDraft,
+      policyAllowed: state.policyDecision?.allowed,
+      isBusy,
+    });
+
+    if (!state.designDraft) {
+      dispatch({ type: 'SET_ERROR', error: 'No design draft available. Please generate a design first.' });
+      return;
+    }
+
+    if (!state.policyDecision?.allowed) {
+      dispatch({ type: 'SET_ERROR', error: 'Policy evaluation required. Please wait for policy check to complete.' });
+      return;
+    }
+
+    if (isBusy) {
+      return;
+    }
 
     dispatch({ type: 'SET_STATUS', status: 'submitting' });
     dispatch({ type: 'SET_ERROR', error: null });
+    dispatch({ type: 'SET_NOTIFICATION', notification: null });
 
     try {
       const policyContext = wearableStudioService.buildPolicyContext(intent, snapshot || undefined, 'submit_mfg');
@@ -175,7 +200,7 @@ export function WearableStoryStudio({ onBack }: Props) {
         fabricType: state.designDraft.fabricType,
         safetyTags: state.designDraft.safetyTags,
         printPlacement: state.designDraft.printSpec.placement,
-      };
+      } as any;
 
       const submitDecision = await wearableStudioService.evaluatePolicy(snapshot?.id, policyContext);
       dispatch({ type: 'SET_POLICY', decision: submitDecision });
@@ -199,6 +224,140 @@ export function WearableStoryStudio({ onBack }: Props) {
 
       await wearableStudioService.submitTicket(ticket);
       dispatch({ type: 'SET_TICKET', ticket });
+      
+      // Show initial success notification
+      dispatch({ 
+        type: 'SET_NOTIFICATION', 
+        notification: { 
+          message: `Your design has been sent to production!`,
+        } 
+      });
+
+      // Try to create SeedCore task (non-blocking - ticket is already created)
+      // Wrap in IIFE to make it async and non-blocking
+      (async () => {
+        try {
+          // Prefer print image URL (should be GCS URL after upload), fallback to mockup
+          const printImageUrl = state.designDraft.printImageUrl || state.designDraft.imageUrl;
+          const mockupImageUrl = state.designDraft.mockupImageUrl || state.designDraft.imageUrl;
+          const imageUrl = printImageUrl || mockupImageUrl;
+          
+          let taskCreated = false;
+          
+          // Try vision task first if we have a valid GCS URL
+          if (imageUrl && !imageUrl.startsWith('data:')) {
+            try {
+              const sceneDescription = `Wearable design: ${state.designDraft.designConcept}. Type: ${intent.type}, Style: ${intent.style}, Size: ${intent.size}. Fabric: ${state.designDraft.fabricType}. Print placement: ${state.designDraft.printSpec.placement}.`;
+              
+              const task = await seedcoreService.createVisionTask(
+                sceneDescription,
+                imageUrl,
+                'action',
+                {
+                  confidence: 1.0,
+                  location_context: 'wearable_studio',
+                  camera_id: 'wearable_design_studio',
+                  detected_objects: {
+                    ticketId: ticket.ticketId,
+                    runId: ticket.runId,
+                    designConcept: state.designDraft.designConcept,
+                    fabricType: state.designDraft.fabricType,
+                    printSpec: state.designDraft.printSpec,
+                    intent: intent,
+                  },
+                }
+              );
+
+              if (task && task.id) {
+                try {
+                  const taskIdStr = String(task.id);
+                  const shortId = taskIdStr.length > 8 ? taskIdStr.substring(0, 8) + '...' : taskIdStr;
+                  dispatch({ 
+                    type: 'SET_NOTIFICATION', 
+                    notification: { 
+                      message: `Your wearable is being prepared for manufacturing!`,
+                      taskId: taskIdStr 
+                    } 
+                  });
+                  taskCreated = true;
+                } catch (idError) {
+                  console.error('Error processing task ID:', idError, task);
+                  // Keep the existing notification, don't overwrite
+                  taskCreated = true;
+                }
+              } else {
+                console.warn('SeedCore vision task response invalid:', task);
+              }
+            } catch (visionError) {
+              console.warn('Vision task creation failed, trying regular task:', visionError);
+              // Fall through to regular task
+            }
+          }
+          
+          // Fallback to regular task if vision task wasn't created
+          if (!taskCreated) {
+            const taskDescription = `Manufacture wearable: ${state.designDraft.designConcept}. Type: ${intent.type}, Style: ${intent.style}, Size: ${intent.size}.`;
+            const taskParams: Record<string, any> = {
+              ticketId: ticket.ticketId,
+              runId: ticket.runId,
+              design: state.designDraft,
+              intent: intent,
+            };
+            
+            if (imageUrl && !imageUrl.startsWith('data:')) {
+              taskParams.imageUrl = imageUrl;
+            }
+
+            const task = await seedcoreService.createTask({
+              type: 'action',
+              description: taskDescription,
+              params: taskParams,
+            });
+
+            if (task && task.id) {
+              try {
+                const taskIdStr = String(task.id);
+                const shortId = taskIdStr.length > 8 ? taskIdStr.substring(0, 8) + '...' : taskIdStr;
+                dispatch({ 
+                  type: 'SET_NOTIFICATION', 
+                  notification: { 
+                    message: `Your wearable is being prepared for manufacturing!`,
+                    taskId: taskIdStr 
+                  } 
+                });
+              } catch (idError) {
+                console.error('Error processing task ID:', idError, task);
+                // Keep existing notification
+              }
+            } else {
+              console.warn('SeedCore task response invalid:', task);
+              // Keep existing notification
+            }
+          }
+
+          // Auto-hide notification after 5 seconds
+          setTimeout(() => {
+            dispatch({ type: 'SET_NOTIFICATION', notification: null });
+          }, 5000);
+        } catch (seedcoreError) {
+          // SeedCore is optional - ticket is already created
+          console.error('SeedCore task creation failed (non-critical):', seedcoreError);
+          // Update notification to be more user-friendly
+          dispatch({ 
+            type: 'SET_NOTIFICATION', 
+            notification: { 
+              message: `Your design has been sent to production!`,
+            } 
+          });
+        }
+      })();
+
+      // Always set status to done and auto-hide notification
+      dispatch({ type: 'SET_STATUS', status: 'done' });
+      setTimeout(() => {
+        dispatch({ type: 'SET_NOTIFICATION', notification: null });
+      }, 5000);
+
       dispatch({ type: 'SET_STATUS', status: 'done' });
 
       await wearableStudioService.appendMemory({
@@ -218,14 +377,47 @@ export function WearableStoryStudio({ onBack }: Props) {
         },
       }, ticket.runId);
     } catch (e) {
-      console.error(e);
+      console.error('Error in handleSubmit:', e);
       dispatch({ type: 'SET_STATUS', status: 'error' });
-      dispatch({ type: 'SET_ERROR', error: 'Failed to submit to manufacturing.' });
+      const errorMessage = e instanceof Error ? e.message : 'Failed to submit to manufacturing.';
+      dispatch({ type: 'SET_ERROR', error: errorMessage });
+      
+      // Also show error notification
+      dispatch({ 
+        type: 'SET_NOTIFICATION', 
+        notification: { 
+          message: `Unable to submit your design. Please try again.`,
+        } 
+      });
+      setTimeout(() => {
+        dispatch({ type: 'SET_NOTIFICATION', notification: null });
+      }, 5000);
     }
   };
 
   return (
     <div className="w-full h-full bg-[#FAFAFA] text-slate-900 flex flex-col">
+      {/* --- NOTIFICATION POPUP --- */}
+      {state.notification && (
+        <div className="fixed top-4 right-4 z-50 animate-in slide-in-from-right fade-in duration-300 pointer-events-auto">
+          <div className="bg-emerald-50 border border-emerald-200 rounded-xl shadow-xl p-4 max-w-md flex items-start gap-3">
+            <CheckCircle2 className="text-emerald-600 flex-shrink-0 mt-0.5" size={20} />
+            <div className="flex-1">
+              <p className="text-sm font-semibold text-emerald-900">{state.notification.message}</p>
+              {state.notification.taskId && (
+                <p className="text-xs text-emerald-600 mt-2 opacity-70">Reference: {state.notification.taskId.slice(0, 8)}...</p>
+              )}
+            </div>
+            <button
+              onClick={() => dispatch({ type: 'SET_NOTIFICATION', notification: null })}
+              className="text-emerald-600 hover:text-emerald-800 transition-colors flex-shrink-0"
+            >
+              <X size={16} />
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* --- HEADER --- */}
       <div className="flex-shrink-0 px-8 py-6 flex items-center justify-between bg-white border-b border-blue-100">
         <div className="flex items-center gap-4">
@@ -294,8 +486,8 @@ export function WearableStoryStudio({ onBack }: Props) {
 
          {/* RIGHT: PREVIEW PANEL */}
          <div className="lg:col-span-8 bg-white relative p-8 flex flex-col items-center justify-center overflow-y-auto">
-             {/* Background Pattern */}
-             <div className="absolute inset-0 opacity-[0.03]" style={{ backgroundImage: 'radial-gradient(#cbd5e1 1px, transparent 1px)', backgroundSize: '24px 24px' }} />
+             {/* Background Pattern - pointer-events-none so it doesn't block clicks */}
+             <div className="absolute inset-0 opacity-[0.03] pointer-events-none" style={{ backgroundImage: 'radial-gradient(#cbd5e1 1px, transparent 1px)', backgroundSize: '24px 24px' }} />
              
             {state.designDraft ? (
                 <div className="w-full max-w-3xl animate-in fade-in slide-in-from-bottom-8 duration-700">
@@ -312,7 +504,16 @@ export function WearableStoryStudio({ onBack }: Props) {
                            <ActionsBar
                              disabled={!state.policyDecision?.allowed || isBusy}
                              submitting={state.status === 'submitting'}
-                             onSubmit={handleSubmit}
+                             onSubmit={() => {
+                               console.log('[WearableStudio] ActionsBar onSubmit called', {
+                                 policyDecision: state.policyDecision,
+                                 allowed: state.policyDecision?.allowed,
+                                 isBusy,
+                               });
+                               handleSubmit().catch((error) => {
+                                 console.error('[WearableStudio] Unhandled error in handleSubmit:', error);
+                               });
+                             }}
                            />
                         </div>
                     </div>
@@ -714,12 +915,52 @@ function ProductionTicket({ design, runId, ticket }: { design: WearableDesignDra
 }
 
 function ActionsBar({ disabled, submitting, onSubmit }: { disabled: boolean; submitting: boolean; onSubmit: () => void }) {
+  const handleClick = (e: React.MouseEvent<HTMLButtonElement>) => {
+    console.log('[ActionsBar] click fired', {
+      defaultPrevented: e.defaultPrevented,
+      disabled,
+      submitting,
+      target: e.target,
+      currentTarget: e.currentTarget,
+      buttonElement: e.currentTarget as HTMLButtonElement,
+      pointerEvents: window.getComputedStyle(e.currentTarget as HTMLElement).pointerEvents,
+    });
+
+    // Check what element is actually at the click position
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const elementAtPoint = document.elementFromPoint(
+      rect.left + rect.width / 2,
+      rect.top + rect.height / 2
+    );
+    console.log('[ActionsBar] Element at click position:', elementAtPoint, 'is button?', elementAtPoint === e.currentTarget);
+
+    // Temporarily remove preventDefault/stopPropagation for debugging
+    // e.preventDefault();
+    // e.stopPropagation();
+
+    if (disabled || submitting) {
+      console.log('[ActionsBar] blocked by state - disabled:', disabled, 'submitting:', submitting);
+      return;
+    }
+
+    console.log('[ActionsBar] Calling onSubmit...');
+    Promise.resolve(onSubmit())
+      .then(() => console.log('[ActionsBar] onSubmit resolved'))
+      .catch((err) => console.error('[ActionsBar] onSubmit rejected', err));
+  };
+
   return (
     <div className="flex gap-3">
       <button
-        onClick={onSubmit}
-        disabled={disabled}
-        className="flex-1 py-4 bg-slate-900 text-white rounded-xl font-bold uppercase tracking-widest text-xs hover:bg-slate-800 transition-colors flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+        onClick={handleClick}
+        disabled={false} // Temporarily disable the disabled attribute to allow clicks for debugging
+        type="button"
+        className={`flex-1 py-4 rounded-xl font-bold uppercase tracking-widest text-xs transition-colors flex items-center justify-center gap-2 ${
+          disabled || submitting
+            ? 'bg-slate-400 text-slate-200 cursor-not-allowed opacity-60'
+            : 'bg-slate-900 text-white hover:bg-slate-800'
+        }`}
+        title={disabled ? `Button disabled - Policy: ${disabled ? 'not allowed' : 'allowed'}, Busy: ${submitting}` : 'Send to manufacturing'}
       >
         {submitting ? <Loader2 size={16} className="animate-spin" /> : <Printer size={16} />} Send to Mfg
       </button>

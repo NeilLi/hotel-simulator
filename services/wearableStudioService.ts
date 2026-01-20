@@ -69,6 +69,26 @@ const createRunId = () => {
 
 const getAI = () => new GoogleGenAI({ apiKey: process.env.API_KEY });
 
+/**
+ * Uploads a design image to Google Cloud Storage via the server API.
+ * Handles both data URLs (base64) and regular URLs.
+ */
+async function uploadDesignToGCS(imageUrl: string, runId: string, suffix: 'print' | 'mockup'): Promise<string> {
+  const response = await fetch(`${API_BASE_URL}/api/designs/upload`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ imageUrl, runId, suffix }),
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ error: response.statusText }));
+    throw new Error(`Failed to upload design to GCS: ${error.error || response.statusText}`);
+  }
+
+  const result = await response.json();
+  return result.url;
+}
+
 const buildMockupPrompt = (intent: WearableIntent, draft: WearableDesignDraft) => {
   const palette = draft.printSpec.palette.join(", ");
   return `High-end studio product photography of a ${intent.style} ${intent.type} in size ${intent.size}.
@@ -174,7 +194,7 @@ export const wearableStudioService = {
       },
     };
   },
-  async designWearable(request: { systemInstruction: string; responseSchema: any; payload: any }) {
+  async designWearable(request: { systemInstruction: string; responseSchema: any; payload: any }, runId?: string) {
     const ai = getAI();
     const response = await ai.models.generateContent({
       model: DESIGN_MODEL,
@@ -195,6 +215,7 @@ export const wearableStudioService = {
     const validated = WearableDesignDraftSchema.parse(parsed);
 
     const intent = request.payload.intent as WearableIntent;
+    const designRunId = runId || createRunId();
 
     // 1) Print artwork (design-grade)
     let printImageUrl: string | null = null;
@@ -210,7 +231,14 @@ export const wearableStudioService = {
         if (printResponse.candidates?.[0]?.content?.parts) {
           for (const part of printResponse.candidates[0].content.parts) {
             if (part.inlineData?.data) {
-              printImageUrl = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+              const tempDataUrl = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+              // Upload to GCS and get permanent URL
+              try {
+                printImageUrl = await uploadDesignToGCS(tempDataUrl, designRunId, 'print');
+              } catch (uploadError) {
+                console.warn("Failed to upload print image to GCS, using data URL", uploadError);
+                printImageUrl = tempDataUrl; // Fallback to data URL
+              }
               break;
             }
           }
@@ -235,7 +263,14 @@ export const wearableStudioService = {
         if (mockupResponse.candidates?.[0]?.content?.parts) {
           for (const part of mockupResponse.candidates[0].content.parts) {
             if (part.inlineData?.data) {
-              mockupImageUrl = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+              const tempDataUrl = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+              // Upload to GCS and get permanent URL
+              try {
+                mockupImageUrl = await uploadDesignToGCS(tempDataUrl, designRunId, 'mockup');
+              } catch (uploadError) {
+                console.warn("Failed to upload mockup image to GCS, using data URL", uploadError);
+                mockupImageUrl = tempDataUrl; // Fallback to data URL
+              }
               break;
             }
           }
