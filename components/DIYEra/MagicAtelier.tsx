@@ -1,6 +1,8 @@
-import React, { useState } from 'react';
-import { ArrowLeft, Sparkles, Wand2, Zap, Printer, CheckCircle, MessageCircle, Bot } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { ArrowLeft, Sparkles, Wand2, Zap, Printer, CheckCircle, MessageCircle, Bot, ShieldAlert, ShieldCheck, ShieldX } from 'lucide-react';
 import { geminiService, ToyDesignResult } from '../../services/geminiService';
+import { wearableStudioService } from '../../services/wearableStudioService';
+import type { PolicyDecision } from '../../services/wearableStudioTypes';
 
 const TOY_TEMPLATES = [
   { 
@@ -30,24 +32,92 @@ interface Props {
   onBack: () => void;
 }
 
+type Snapshot = { id: number; version: string; env: string; isActive: boolean };
+
 export function MagicAtelier({ onBack }: Props) {
   const [step, setStep] = useState<'SELECT' | 'DREAM' | 'REVEAL'>('SELECT');
   const [selectedTemplate, setSelectedTemplate] = useState(TOY_TEMPLATES[0]);
   const [wish, setWish] = useState("");
   const [isMagicHappening, setIsMagicHappening] = useState(false);
   const [result, setResult] = useState<ToyDesignResult | null>(null);
+  const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
+  const [policyDecision, setPolicyDecision] = useState<PolicyDecision | null>(null);
+  const [policyStatus, setPolicyStatus] = useState<'idle' | 'checking' | 'checked'>('idle');
+  const [policyError, setPolicyError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    wearableStudioService.getActiveSnapshot()
+      .then((snap) => {
+        if (active) {
+          setSnapshot(snap as Snapshot | null);
+        }
+      })
+      .catch((error) => {
+        console.warn("Failed to load snapshot", error);
+        if (active) {
+          setSnapshot(null);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const handleCastSpell = async () => {
     if (!wish.trim()) return;
+    
+    // Policy check before generating
+    setPolicyStatus('checking');
+    setPolicyError(null);
     setIsMagicHappening(true);
+    
     try {
-       const data = await geminiService.designToy(selectedTemplate.name, wish);
-       setResult(data);
-       setStep('REVEAL');
+      // Build policy context for toy design
+      const policyContext = {
+        tags: [
+          "scene=magic_atelier",
+          "action=design_toy",
+          `toy_type=${selectedTemplate.id}`,
+          `toy_name=${selectedTemplate.name}`,
+        ],
+        signals: {
+          risk_score: Math.min(wish.length / 1000, 1),
+          content_category: "toy_design",
+          age_rating: "kids",
+          region: "global",
+          device: "router",
+        },
+        values: {
+          template: selectedTemplate.id,
+          wish: wish.slice(0, 200), // Truncate for context
+          persona: "guest",
+        },
+        snapshot: snapshot
+          ? { snapshotId: snapshot.id, version: snapshot.version, env: snapshot.env }
+          : undefined,
+      };
+
+      const decision = await wearableStudioService.evaluatePolicy(snapshot?.id, policyContext);
+      setPolicyDecision(decision);
+      setPolicyStatus('checked');
+
+      if (decision.blocked) {
+        setPolicyError(decision.reasons[0] || 'Policy blocked this request.');
+        setIsMagicHappening(false);
+        return;
+      }
+
+      // Proceed with toy design
+      const data = await geminiService.designToy(selectedTemplate.name, wish);
+      setResult(data);
+      setStep('REVEAL');
     } catch (e) {
-       alert("The magic fizzled out! Try again.");
+      console.error('Error in handleCastSpell:', e);
+      setPolicyError(e instanceof Error ? e.message : "The magic fizzled out! Try again.");
     } finally {
-       setIsMagicHappening(false);
+      setIsMagicHappening(false);
+      setPolicyStatus('idle');
     }
   };
 
@@ -136,14 +206,64 @@ export function MagicAtelier({ onBack }: Props) {
                            />
                         </div>
 
+                        {/* Policy Status Panel */}
+                        <div className="mb-6 rounded-xl border border-rose-200 bg-white/80 p-4 shadow-sm">
+                          <div className="flex items-center justify-between mb-2">
+                            <div className="text-[10px] uppercase tracking-widest font-bold text-rose-400">Policy Gate</div>
+                            {policyStatus === 'checking' ? (
+                              <div className="flex items-center gap-2 text-xs font-bold text-amber-600">
+                                <ShieldAlert size={14} className="animate-pulse" />
+                                Checking...
+                              </div>
+                            ) : policyDecision?.blocked ? (
+                              <div className="flex items-center gap-2 text-xs font-bold text-rose-600">
+                                <ShieldX size={14} />
+                                Blocked
+                              </div>
+                            ) : policyDecision?.allowed ? (
+                              <div className="flex items-center gap-2 text-xs font-bold text-emerald-600">
+                                <ShieldCheck size={14} />
+                                Allowed
+                              </div>
+                            ) : (
+                              <div className="flex items-center gap-2 text-xs font-bold text-slate-400">
+                                <ShieldAlert size={14} />
+                                Pending
+                              </div>
+                            )}
+                          </div>
+                          <div className="mt-3 space-y-2 text-xs text-rose-600 font-medium">
+                            <div>
+                              Snapshot: <span className="font-bold text-rose-800">{snapshot?.version || 'unavailable'}</span>
+                            </div>
+                            {policyError && (
+                              <div className="text-xs text-rose-600 font-medium bg-rose-50 p-2 rounded-lg">
+                                {policyError}
+                              </div>
+                            )}
+                            {policyDecision?.reasons?.length ? (
+                              <div className="text-[11px] text-rose-500">
+                                {policyDecision.reasons.slice(0, 2).join(' · ')}
+                              </div>
+                            ) : policyStatus === 'idle' ? (
+                              <div className="text-[11px] text-rose-400">Policy evaluation ready.</div>
+                            ) : null}
+                            {policyDecision?.ruleHits?.length ? (
+                              <div className="text-[10px] text-rose-400 uppercase tracking-widest">
+                                Hits: {policyDecision.ruleHits.slice(0, 3).map((hit) => hit.ruleName).join(', ')}
+                              </div>
+                            ) : null}
+                          </div>
+                        </div>
+
                         <button 
                            onClick={handleCastSpell}
-                           disabled={!wish.trim() || isMagicHappening}
+                           disabled={!wish.trim() || isMagicHappening || (policyDecision?.blocked === true)}
                            className="w-full py-5 rounded-2xl bg-gradient-to-r from-rose-500 to-purple-600 text-white font-black text-lg uppercase tracking-widest shadow-lg shadow-purple-200 hover:scale-[1.02] active:scale-95 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-3"
                         >
                            {isMagicHappening ? (
                               <>
-                                 <Wand2 className="animate-spin" /> Casting Spell...
+                                 <Wand2 className="animate-spin" /> {policyStatus === 'checking' ? 'Checking Policy...' : 'Casting Spell...'}
                               </>
                            ) : (
                               <>

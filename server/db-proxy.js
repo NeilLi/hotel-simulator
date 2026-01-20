@@ -15,7 +15,6 @@ import express from 'express';
 import cors from 'cors';
 import { Pool } from 'pg';
 import crypto from 'crypto';
-import { Storage } from '@google-cloud/storage';
 
 const app = express();
 const PORT = process.env.DB_PROXY_PORT || 3001;
@@ -36,9 +35,10 @@ app.use(cors({
   },
   credentials: true
 }));
-// Increase body size limit to handle large base64 image payloads (50MB)
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+// Increase body size limit to handle large payloads (e.g., design metadata with images)
+// Default is 100kb, increase to 10MB for wearable design data
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Database configuration (from environment or defaults matching docker/env.example)
 // Note: The actual database name is 'seedcore', not 'postgres' (see PG_DSN in env.example)
@@ -906,35 +906,50 @@ app.get('/api/facts', async (req, res) => {
         id::text as id,
         snapshot_id,
         namespace,
+        text,
+        tags,
+        meta_data,
         subject,
         predicate,
-        object_data as object,
+        object_data,
         valid_from,
         valid_to,
+        pkg_rule_id,
+        pkg_provenance,
+        validation_status,
         created_by,
+        created_at,
+        updated_at,
         CASE
-          WHEN valid_to IS NULL THEN 'active'
+          WHEN valid_from IS NOT NULL AND valid_from > NOW() THEN 'future'
+          WHEN valid_to IS NULL THEN 'indefinite'
           WHEN valid_to > NOW() THEN 'active'
           ELSE 'expired'
         END as status
       FROM facts
       WHERE namespace IS NOT NULL
-        AND subject IS NOT NULL
-        AND predicate IS NOT NULL
-      ORDER BY valid_from DESC
+      ORDER BY COALESCE(valid_from, created_at) DESC NULLS LAST
       LIMIT 100
     `);
     res.json(result.rows.map(row => ({
       id: row.id,
       snapshotId: row.snapshot_id || undefined,
       namespace: row.namespace,
+      text: row.text,
+      tags: row.tags || [],
+      metaData: row.meta_data || {},
       subject: row.subject,
       predicate: row.predicate,
-      object: row.object || {},
-      validFrom: row.valid_from.toISOString(),
-      validTo: row.valid_to?.toISOString(),
+      object: row.object_data || {},
+      validFrom: row.valid_from ? row.valid_from.toISOString() : undefined,
+      validTo: row.valid_to ? row.valid_to.toISOString() : undefined,
+      pkgRuleId: row.pkg_rule_id || undefined,
+      pkgProvenance: row.pkg_provenance || undefined,
+      validationStatus: row.validation_status || undefined,
       status: row.status,
       createdBy: row.created_by || undefined,
+      createdAt: row.created_at ? row.created_at.toISOString() : undefined,
+      updatedAt: row.updated_at ? row.updated_at.toISOString() : undefined,
     })));
   } catch (error) {
     console.error('Error fetching facts:', error);
@@ -1215,44 +1230,140 @@ app.post('/api/rules', async (req, res) => {
 
 // Create fact
 app.post('/api/facts', async (req, res) => {
+  const client = await pool.connect();
   try {
-    const { snapshotId, namespace, subject, predicate, object, validFrom, validTo, createdBy } = req.body;
+    await client.query('BEGIN');
     
-    // Generate text representation of the fact (required field)
-    const factText = `${subject} ${predicate} ${JSON.stringify(object || {})}`;
-    
-    const result = await pool.query(`
-      INSERT INTO facts (snapshot_id, namespace, subject, predicate, object_data, text, valid_from, valid_to, created_by)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-      RETURNING id::text as id, snapshot_id, namespace, subject, predicate, object_data as object, valid_from, valid_to, created_by
-    `, [
-      snapshotId || null,
-      namespace || 'default',
+    const {
+      text, // Required in new schema
+      namespace,
       subject,
       predicate,
-      JSON.stringify(object || {}),
-      factText,
-      validFrom ? new Date(validFrom) : new Date(),
-      validTo ? new Date(validTo) : null,
-      createdBy || 'system'
+      object_data, // New schema uses object_data
+      tags,
+      meta_data,
+      valid_from,
+      valid_to,
+      snapshot_id,
+      pkg_rule_id,
+      pkg_provenance,
+      validation_status,
+      created_by
+    } = req.body;
+    
+    // Validate required fields
+    if (!text || !text.trim()) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'text field is required' });
+    }
+    
+    if (!namespace || !namespace.trim()) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'namespace field is required' });
+    }
+    
+    // Validate structured triple: all or none
+    const hasStructured = subject || predicate || object_data !== undefined;
+    const hasAllStructured = subject && predicate && object_data !== undefined;
+    
+    if (hasStructured && !hasAllStructured) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ 
+        error: 'Structured triple requires all fields: subject, predicate, and object_data must all be provided together' 
+      });
+    }
+    
+    // Validate PKG governance: if pkg_rule_id is provided, structured triple is required
+    if (pkg_rule_id && !hasAllStructured) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ 
+        error: 'PKG governed facts (pkg_rule_id) require structured triple (subject, predicate, object_data)' 
+      });
+    }
+    
+    const result = await client.query(`
+      INSERT INTO facts (
+        text,
+        namespace,
+        tags,
+        meta_data,
+        subject,
+        predicate,
+        object_data,
+        valid_from,
+        valid_to,
+        snapshot_id,
+        pkg_rule_id,
+        pkg_provenance,
+        validation_status,
+        created_by
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+      RETURNING 
+        id::text as id,
+        snapshot_id,
+        namespace,
+        text,
+        tags,
+        meta_data,
+        subject,
+        predicate,
+        object_data,
+        valid_from,
+        valid_to,
+        pkg_rule_id,
+        pkg_provenance,
+        validation_status,
+        created_by,
+        created_at,
+        updated_at
+    `, [
+      text.trim(),
+      namespace.trim(),
+      tags || [],
+      meta_data || {},
+      subject || null,
+      predicate || null,
+      object_data !== undefined ? (typeof object_data === 'string' ? object_data : JSON.stringify(object_data)) : null,
+      valid_from ? new Date(valid_from) : null,
+      valid_to ? new Date(valid_to) : null,
+      snapshot_id || null,
+      pkg_rule_id || null,
+      pkg_provenance || null,
+      validation_status || null,
+      created_by || 'system'
     ]);
     
+    await client.query('COMMIT');
+    
     const row = result.rows[0];
+    
+    // Map snake_case to camelCase for response
     res.json({
       id: row.id,
       snapshotId: row.snapshot_id || undefined,
       namespace: row.namespace,
+      text: row.text,
+      tags: row.tags || [],
+      metaData: row.meta_data || {},
       subject: row.subject,
       predicate: row.predicate,
-      object: row.object || {},
-      validFrom: row.valid_from.toISOString(),
+      object: row.object_data || {},
+      validFrom: row.valid_from?.toISOString(),
       validTo: row.valid_to?.toISOString(),
-      status: 'active',
-      createdBy: row.created_by || undefined,
+      pkgRuleId: row.pkg_rule_id,
+      pkgProvenance: row.pkg_provenance,
+      validationStatus: row.validation_status,
+      createdBy: row.created_by,
+      createdAt: row.created_at?.toISOString(),
+      updatedAt: row.updated_at?.toISOString(),
     });
   } catch (error) {
+    await client.query('ROLLBACK');
     console.error('Error creating fact:', error);
     res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -1611,98 +1722,152 @@ app.post('/api/memory/append', async (req, res) => {
     }
     
     if (tier === 'event_working') {
-      // Write to tasks + task_multimodal_embeddings (Tier A)
-      // Generate a UUID for the task
-      const taskIdResult = await client.query('SELECT gen_random_uuid() as id');
-      const taskId = taskIdResult.rows[0].id;
+      // ARCHITECTURE: Hotel Simulator does NOT create tasks directly in the database
+      // Tasks are ONLY created via SeedCore API calls (seedcoreService.createTask/createVisionTask)
+      // which go to SeedCore server (port 8002), which then creates tasks in the database
+      // 
+      // This endpoint is ONLY for storing working memory/logging during design generation
+      // It does NOT create tasks - that's SeedCore's responsibility
       
-      // Map category to valid task type enum values
-      // Valid types: "chat", "query", "action", "graph", "maintenance", "unknown"
-      const validTaskTypes = ['chat', 'query', 'action', 'graph', 'maintenance', 'unknown'];
-      let taskType = 'action'; // Default to 'action' for wearable design seeds
+      // Check if we should create a task (only if explicitly requested via metadata.createTask)
+      // NOTE: This should rarely be used - tasks should be created via SeedCore API instead
+      const shouldCreateTask = metadata?.createTask === true;
       
-      // Try to map category to a valid type
-      if (category.includes('design') || category.includes('wearable') || category.includes('seed')) {
-        taskType = 'action'; // Design/wearable tasks are actions
-      } else if (category.includes('query') || category.includes('search')) {
-        taskType = 'query';
-      } else if (category.includes('chat') || category.includes('conversation')) {
-        taskType = 'chat';
-      } else if (category.includes('graph') || category.includes('knowledge')) {
-        taskType = 'graph';
-      } else if (validTaskTypes.includes(category.toLowerCase())) {
-        taskType = category.toLowerCase();
-      }
+      let taskId = null;
       
-      // Store original category in metadata
-      const taskMetadata = {
-        ...(metadata || {}),
-        original_category: category,
-        task_category: category
-      };
-      
-      // Insert into tasks table
-      // Use SAVEPOINT before the insert to allow safe rollback on failure
-      await client.query('SAVEPOINT sp_task_insert');
-      
-      try {
-        // Always include status with the cached default value
-        // This prevents NOT NULL constraint violations
+      if (shouldCreateTask) {
+        // Only create task if explicitly requested
+        // Generate a UUID for the task
+        const taskIdResult = await client.query('SELECT gen_random_uuid() as id');
+        taskId = taskIdResult.rows[0].id;
+        
+        // Map category to valid task type enum values
+        // Valid types: "chat", "query", "action", "graph", "maintenance", "unknown"
+        const validTaskTypes = ['chat', 'query', 'action', 'graph', 'maintenance', 'unknown'];
+        let taskType = 'action'; // Default to 'action' for wearable design seeds
+        
+        // Try to map category to a valid type
+        if (category.includes('design') || category.includes('wearable') || category.includes('seed')) {
+          taskType = 'action'; // Design/wearable tasks are actions
+        } else if (category.includes('query') || category.includes('search')) {
+          taskType = 'query';
+        } else if (category.includes('chat') || category.includes('conversation')) {
+          taskType = 'chat';
+        } else if (category.includes('graph') || category.includes('knowledge')) {
+          taskType = 'graph';
+        } else if (validTaskTypes.includes(category.toLowerCase())) {
+          taskType = category.toLowerCase();
+        }
+        
+        // Store original category in metadata
+        const taskMetadata = {
+          ...(metadata || {}),
+          original_category: category,
+          task_category: category
+        };
+        
+        // Extract snapshot_id from metadata or fetch active snapshot
+        // Support multiple formats: metadata.snapshot_id, metadata.snapshot.id, or metadata.snapshotId
+        let snapshotId = metadata?.snapshot_id || 
+                         metadata?.snapshotId ||
+                         (metadata?.snapshot && (metadata.snapshot.id || metadata.snapshot.snapshotId)) ||
+                         null;
+        
+        // If snapshot_id is not in metadata, try to get the active snapshot
+        if (!snapshotId) {
+          try {
+            const activeSnapshotResult = await client.query(`
+              SELECT id FROM pkg_snapshots WHERE is_active = TRUE ORDER BY created_at DESC LIMIT 1
+            `);
+            if (activeSnapshotResult.rows.length > 0) {
+              snapshotId = activeSnapshotResult.rows[0].id;
+              console.log(`[memory/append] Using active snapshot_id: ${snapshotId}`);
+            }
+          } catch (snapshotError) {
+            console.warn('Could not fetch active snapshot:', snapshotError.message);
+            // Continue without snapshot_id - will fail with clear error if required
+          }
+        }
+        
+        // Validate snapshot_id before proceeding with task creation
+        if (!snapshotId || (typeof snapshotId === 'number' && snapshotId <= 0)) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({ 
+            error: 'snapshot_id is required for task creation. Provide it in metadata.snapshot_id, metadata.snapshot.id, or ensure an active snapshot exists in the database.' 
+          });
+        }
+        
+        // Insert into tasks table
+        // Use SAVEPOINT before the insert to allow safe rollback on failure
+        await client.query('SAVEPOINT sp_task_insert');
+        
+        try {
+          // Always include status and snapshot_id with the cached default value
+          // This prevents NOT NULL constraint violations
+          // Note: snapshot_id is required by the tasks table schema
+          await client.query(`
+            INSERT INTO tasks (id, type, description, params, status, snapshot_id)
+            VALUES ($1, $2, $3, $4, $5, $6)
+          `, [
+            taskId,
+            taskType,
+            content,
+            JSON.stringify(taskMetadata),
+            TASK_STATUS_DEFAULT,
+            snapshotId
+          ]);
+          
+          await client.query('RELEASE SAVEPOINT sp_task_insert');
+        } catch (insertError) {
+          // Log the root cause error (not just the 25P02 symptom)
+          console.error('❌ tasks insert failed (root cause):', {
+            code: insertError.code,
+            message: insertError.message,
+            detail: insertError.detail,
+            constraint: insertError.constraint,
+            column: insertError.column,
+            dataType: insertError.dataType
+          });
+          
+          // Rollback to savepoint (this prevents transaction abort)
+          await client.query('ROLLBACK TO SAVEPOINT sp_task_insert');
+          await client.query('RELEASE SAVEPOINT sp_task_insert');
+          
+          // Re-throw the error - don't continue in the same transaction
+          throw insertError;
+        }
+        
+        // Generate a dummy embedding vector (1024 dimensions) - in production, this would come from an embedding service
+        // For now, we'll use a zero vector or a simple hash-based vector
+        const embeddingVector = Array(1024).fill(0).map(() => Math.random() * 0.01 - 0.005); // Small random values
+        const embeddingStr = `[${embeddingVector.join(',')}]`;
+        
+        // Insert into task_multimodal_embeddings (only if task was created)
         await client.query(`
-          INSERT INTO tasks (id, type, description, params, status)
-          VALUES ($1, $2, $3, $4, $5)
+          INSERT INTO task_multimodal_embeddings (task_id, emb, source_modality, model_version)
+          VALUES ($1, $2::vector, $3, $4)
         `, [
           taskId,
-          taskType,
-          content,
-          JSON.stringify(taskMetadata),
-          TASK_STATUS_DEFAULT
+          embeddingStr,
+          metadata?.source_modality || 'text',
+          metadata?.model_version || 'default'
         ]);
-        
-        await client.query('RELEASE SAVEPOINT sp_task_insert');
-      } catch (insertError) {
-        // Log the root cause error (not just the 25P02 symptom)
-        console.error('❌ tasks insert failed (root cause):', {
-          code: insertError.code,
-          message: insertError.message,
-          detail: insertError.detail,
-          constraint: insertError.constraint,
-          column: insertError.column,
-          dataType: insertError.dataType
-        });
-        
-        // Rollback to savepoint (this prevents transaction abort)
-        await client.query('ROLLBACK TO SAVEPOINT sp_task_insert');
-        await client.query('RELEASE SAVEPOINT sp_task_insert');
-        
-        // Re-throw the error - don't continue in the same transaction
-        throw insertError;
+      } else {
+        // No task creation - just store memory metadata/logging
+        // This is the normal case for event_working during design generation
+        // Tasks are created separately via SeedCore API (seedcoreService.createTask/createVisionTask)
+        console.log(`[memory/append] Storing event_working memory (no task created) for category: ${category}`);
       }
-      
-      // Generate a dummy embedding vector (1024 dimensions) - in production, this would come from an embedding service
-      // For now, we'll use a zero vector or a simple hash-based vector
-      const embeddingVector = Array(1024).fill(0).map(() => Math.random() * 0.01 - 0.005); // Small random values
-      const embeddingStr = `[${embeddingVector.join(',')}]`;
-      
-      // Insert into task_multimodal_embeddings
-      await client.query(`
-        INSERT INTO task_multimodal_embeddings (task_id, emb, source_modality, model_version)
-        VALUES ($1, $2::vector, $3, $4)
-      `, [
-        taskId,
-        embeddingStr,
-        metadata?.source_modality || 'text',
-        metadata?.model_version || 'default'
-      ]);
       
       await client.query('COMMIT');
       
       res.json({
-        id: taskId,
+        id: taskId || `memory_${Date.now()}`,
         tier: 'event_working',
         category,
         content,
-        metadata: metadata || {}
+        metadata: metadata || {},
+        taskCreated: shouldCreateTask
       });
     } else if (tier === 'knowledge_base') {
       // Write to graph_embeddings_1024 (Tier B/C)
@@ -1843,12 +2008,19 @@ app.post('/api/memory/append', async (req, res) => {
 });
 
 // POST /api/memory/promote - Promote an item from event_working to knowledge_base
+// Implements the "Read-Transform-Write-Delete" pattern for Unified Memory promotion
 app.post('/api/memory/promote', async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     
-    const { seedHash, taskId, label } = req.body;
+    const { seedHash, taskId, label, actor, snapshotId, deleteSource } = req.body;
+    
+    // Actor defaults to 'system' if not provided
+    const promotionActor = actor || 'system';
+    
+    // Delete source task after promotion (default: true for clean memory)
+    const shouldDeleteSource = deleteSource !== false;
     
     if (!taskId && !seedHash) {
       await client.query('ROLLBACK');
@@ -1857,13 +2029,13 @@ app.post('/api/memory/promote', async (req, res) => {
     
     const memoryLabel = label || 'wearable.ticket';
     
-    // Find the task by taskId (UUID) or by searching metadata for seedHash
+    // STEP 1: READ - Fetch the raw seed/task and its multimodal embeddings from event_working
     let task;
     if (taskId) {
       const taskResult = await client.query('SELECT * FROM tasks WHERE id = $1', [taskId]);
       if (taskResult.rows.length === 0) {
         await client.query('ROLLBACK');
-        return res.status(404).json({ error: `Task ${taskId} not found` });
+        return res.status(404).json({ error: `Task ${taskId} not found in event_working` });
       }
       task = taskResult.rows[0];
     } else {
@@ -1871,14 +2043,16 @@ app.post('/api/memory/promote', async (req, res) => {
       const tasksResult = await client.query('SELECT * FROM tasks WHERE params::text LIKE $1', [`%${seedHash}%`]);
       if (tasksResult.rows.length === 0) {
         await client.query('ROLLBACK');
-        return res.status(404).json({ error: `Task with seedHash ${seedHash} not found` });
+        return res.status(404).json({ error: `Task with seedHash ${seedHash} not found in event_working` });
       }
       task = tasksResult.rows[0];
     }
     
     // Get the embedding from task_multimodal_embeddings
     const embeddingResult = await client.query(`
-      SELECT emb FROM task_multimodal_embeddings WHERE task_id = $1
+      SELECT emb, source_modality, model_version 
+      FROM task_multimodal_embeddings 
+      WHERE task_id = $1
     `, [task.id]);
     
     if (embeddingResult.rows.length === 0) {
@@ -1886,12 +2060,37 @@ app.post('/api/memory/promote', async (req, res) => {
       return res.status(404).json({ error: `No embedding found for task ${task.id}` });
     }
     
-    const embedding = embeddingResult.rows[0].emb;
+    const embeddingData = embeddingResult.rows[0];
+    const embedding = embeddingData.emb;
     
-    // Compute content SHA256
+    // STEP 2: TRANSFORM - Re-map fields to fit the knowledge_base schema
+    // Preserve snapshot_id and pkg_provenance (Migration 016) for auditability
+    const taskParams = task.params || {};
+    const taskMetadata = typeof taskParams === 'string' ? JSON.parse(taskParams) : taskParams;
+    
+    // Extract snapshot_id from task metadata or use provided snapshotId
+    const activeSnapshotId = snapshotId || taskMetadata.snapshot_id || null;
+    
+    // Build pkg_provenance for audit trail (Migration 016)
+    const pkgProvenance = {
+      source_task_id: task.id,
+      source_task_type: task.type,
+      source_status: task.status,
+      promoted_at: new Date().toISOString(),
+      promoted_by: promotionActor,
+      seed_hash: seedHash || taskMetadata.seed_hash,
+      source_modality: embeddingData.source_modality,
+      model_version: embeddingData.model_version,
+      original_created_at: task.created_at,
+      ...(activeSnapshotId && { snapshot_id: activeSnapshotId }),
+      ...(taskMetadata.pkg_rule_id && { pkg_rule_id: taskMetadata.pkg_rule_id }),
+      ...(taskMetadata.pkg_provenance && { inherited_provenance: taskMetadata.pkg_provenance })
+    };
+    
+    // Compute content SHA256 for deduplication
     const contentSha256 = crypto.createHash('sha256').update(task.description || '').digest('hex');
     
-    // Generate node_id - Option A: Check sequence existence first (industry-grade)
+    // Generate node_id - Check sequence existence first (industry-grade)
     let nodeId;
     
     try {
@@ -1936,28 +2135,39 @@ app.post('/api/memory/promote', async (req, res) => {
       return res.status(500).json({ error: `Invalid node_id generated: ${nodeId}` });
     }
     
-    // Insert into graph_embeddings_1024
+    // STEP 3: WRITE - Insert into graph_embeddings_1024 (Tier B/C)
+    // Map the 1024d multimodal vector to the graph embedding table
     const graphResult = await client.query(`
       INSERT INTO graph_embeddings_1024 (node_id, label, emb, model, props, content_sha256)
-      VALUES ($1, $2, $3, $4, $5, $6)
+      VALUES ($1, $2, $3::vector, $4, $5, $6)
       RETURNING node_id
     `, [
       nodeId,
       memoryLabel,
       embedding,
-      'promoted',
+      embeddingData.model_version || 'promoted',
       JSON.stringify({
+        // Preserve original task metadata
         task_id: task.id,
         task_type: task.type,
+        task_description: task.description,
+        // PKG provenance (Migration 016)
+        pkg_provenance: pkgProvenance,
+        snapshot_id: activeSnapshotId,
+        // Promotion metadata
         promoted_at: new Date().toISOString(),
-        seed_hash: seedHash
+        promoted_by: promotionActor,
+        seed_hash: seedHash || taskMetadata.seed_hash,
+        // Embedding metadata
+        source_modality: embeddingData.source_modality,
+        model_version: embeddingData.model_version
       }),
       contentSha256
     ]);
     
     const insertedNodeId = graphResult.rows[0].node_id;
     
-    // Create mapping in graph_node_map
+    // STEP 4: REGISTER - Update the graph_node_map (Migration 017) to link the new entity into the Knowledge Graph
     try {
       await client.query(`
         INSERT INTO graph_node_map (task_id, node_id, relationship_type)
@@ -1966,6 +2176,25 @@ app.post('/api/memory/promote', async (req, res) => {
       `, [task.id, insertedNodeId]);
     } catch (err) {
       console.warn('Could not create graph_node_map entry:', err.message);
+      // Non-fatal error, continue
+    }
+    
+    // STEP 5: CLEAN UP - Remove the original entry from event_working to prevent memory fragmentation
+    if (shouldDeleteSource) {
+      try {
+        // Delete multimodal embeddings first (FK constraint)
+        await client.query(`
+          DELETE FROM task_multimodal_embeddings WHERE task_id = $1
+        `, [task.id]);
+        
+        // Then delete the task
+        await client.query(`
+          DELETE FROM tasks WHERE id = $1
+        `, [task.id]);
+      } catch (deleteError) {
+        console.warn('Could not delete source task (non-fatal):', deleteError.message);
+        // Non-fatal error - promotion succeeded, just log warning
+      }
     }
     
     await client.query('COMMIT');
@@ -1975,18 +2204,29 @@ app.post('/api/memory/promote', async (req, res) => {
       taskId: task.id,
       nodeId: insertedNodeId.toString(),
       label: memoryLabel,
-      message: `Task ${task.id} promoted to knowledge_base as node ${nodeId}`
+      snapshotId: activeSnapshotId,
+      promotedBy: promotionActor,
+      sourceDeleted: shouldDeleteSource,
+      message: `Task ${task.id} successfully promoted to knowledge_base as node ${nodeId}`,
+      provenance: pkgProvenance
     });
   } catch (error) {
-    await client.query('ROLLBACK');
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackError) {
+      // Ignore rollback errors - transaction might already be rolled back
+    }
     console.error('Error promoting memory:', error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ 
+      error: error.message,
+      details: error.detail || null
+    });
   } finally {
     client.release();
   }
 });
 
-// POST /api/policy/evaluate - Evaluate policy for a given context (stub implementation)
+// POST /api/policy/evaluate - Evaluate policy for a given context using PKG rules
 app.post('/api/policy/evaluate', async (req, res) => {
   try {
     const { snapshotId, context } = req.body;
@@ -1995,18 +2235,215 @@ app.post('/api/policy/evaluate', async (req, res) => {
       return res.status(400).json({ error: 'snapshotId and context are required' });
     }
     
-    // Stub implementation - in production, this would evaluate against PKG rules
-    // For now, return a simple allowed/blocked decision based on risk_score
+    // Fetch active rules for this snapshot
+    const rulesResult = await pool.query(`
+      SELECT 
+        r.id, r.rule_name, r.priority, r.engine, r.disabled,
+        r.rule_source, r.metadata
+      FROM pkg_policy_rules r
+      WHERE r.snapshot_id = $1 AND r.disabled = FALSE
+      ORDER BY r.priority ASC
+    `, [snapshotId]);
+    
+    if (rulesResult.rows.length === 0) {
+      // No rules defined - default to allow with warning
+      return res.json({
+        allowed: true,
+        reason: 'No policy rules defined for this snapshot - defaulting to allow',
+        message: 'Policy evaluation passed (no rules)',
+        riskScore: context.signals?.risk_score || 0,
+        matchedRules: []
+      });
+    }
+    
+    // Fetch conditions for all rules
+    const ruleIds = rulesResult.rows.map(r => r.id);
+    const conditionsResult = await pool.query(`
+      SELECT rule_id, condition_type, condition_key, operator, value, position
+      FROM pkg_rule_conditions
+      WHERE rule_id = ANY($1::uuid[])
+      ORDER BY rule_id, position
+    `, [ruleIds]);
+    
+    // Fetch emissions for all rules
+    const emissionsResult = await pool.query(`
+      SELECT 
+        e.rule_id, e.subtask_type_id, e.relationship_type, e.params, e.position,
+        st.name as subtask_name
+      FROM pkg_rule_emissions e
+      JOIN pkg_subtask_types st ON e.subtask_type_id = st.id
+      WHERE e.rule_id = ANY($1::uuid[])
+      ORDER BY e.rule_id, e.position
+    `, [ruleIds]);
+    
+    // Group conditions and emissions by rule_id
+    const conditionsByRule = new Map();
+    const emissionsByRule = new Map();
+    
+    conditionsResult.rows.forEach(row => {
+      if (!conditionsByRule.has(row.rule_id)) {
+        conditionsByRule.set(row.rule_id, []);
+      }
+      conditionsByRule.get(row.rule_id).push({
+        conditionType: row.condition_type,
+        conditionKey: row.condition_key,
+        operator: row.operator,
+        value: row.value,
+      });
+    });
+    
+    emissionsResult.rows.forEach(row => {
+      if (!emissionsByRule.has(row.rule_id)) {
+        emissionsByRule.set(row.rule_id, []);
+      }
+      emissionsByRule.get(row.rule_id).push({
+        subtaskName: row.subtask_name,
+        relationshipType: row.relationship_type,
+        params: row.params,
+        position: row.position,
+      });
+    });
+    
+    // Evaluate rules against context
+    const matchedRules = [];
+    let blockingRule = null;
+    
+    for (const ruleRow of rulesResult.rows) {
+      const ruleId = ruleRow.id;
+      const conditions = conditionsByRule.get(ruleId) || [];
+      
+      // Evaluate all conditions (ALL must pass)
+      let allConditionsMatch = true;
+      const conditionResults = [];
+      
+      for (const condition of conditions) {
+        let actualValue = null;
+        
+        // Resolve value based on condition type
+        switch (condition.conditionType) {
+          case 'TAG':
+            // Check if tag exists in context.tags array
+            const tags = context.tags || [];
+            actualValue = tags.find(t => {
+              if (condition.operator === 'EXISTS') {
+                return t.includes(condition.conditionKey);
+              }
+              if (condition.operator === 'MATCHES') {
+                const regex = new RegExp(condition.value || '');
+                return regex.test(t);
+              }
+              return t === `${condition.conditionKey}=${condition.value}`;
+            });
+            break;
+            
+          case 'SIGNAL':
+            actualValue = context.signals?.[condition.conditionKey];
+            break;
+            
+          case 'VALUE':
+            actualValue = context.values?.[condition.conditionKey] || condition.conditionKey;
+            break;
+            
+          case 'FACT':
+            // Simplified fact check - in production would query facts table
+            actualValue = context.facts?.find(f => f.predicate === condition.conditionKey)?.object;
+            break;
+        }
+        
+        // Evaluate operator
+        let conditionMatches = false;
+        switch (condition.operator) {
+          case 'EXISTS':
+            conditionMatches = actualValue !== undefined && actualValue !== null;
+            break;
+          case '=':
+            conditionMatches = String(actualValue) === condition.value;
+            break;
+          case '!=':
+            conditionMatches = String(actualValue) !== condition.value;
+            break;
+          case '>':
+            conditionMatches = Number(actualValue) > Number(condition.value);
+            break;
+          case '>=':
+            conditionMatches = Number(actualValue) >= Number(condition.value);
+            break;
+          case '<':
+            conditionMatches = Number(actualValue) < Number(condition.value);
+            break;
+          case '<=':
+            conditionMatches = Number(actualValue) <= Number(condition.value);
+            break;
+          case 'IN':
+            const values = (condition.value || '').split(',').map(v => v.trim());
+            conditionMatches = values.includes(String(actualValue));
+            break;
+          case 'MATCHES':
+            if (condition.value && actualValue) {
+              const regex = new RegExp(condition.value);
+              conditionMatches = regex.test(String(actualValue));
+            }
+            break;
+        }
+        
+        conditionResults.push({
+          condition,
+          matches: conditionMatches,
+          actualValue
+        });
+        
+        if (!conditionMatches) {
+          allConditionsMatch = false;
+        }
+      }
+      
+      // If all conditions match, rule is triggered
+      if (allConditionsMatch && conditions.length > 0) {
+        const emissions = emissionsByRule.get(ruleId) || [];
+        matchedRules.push({
+          ruleId: ruleId.toString(),
+          ruleName: ruleRow.rule_name,
+          priority: ruleRow.priority,
+          emissions: emissions,
+          conditionResults
+        });
+        
+        // Check if this rule blocks (has GATE emission or high priority blocking rule)
+        // Rules with GATE emissions typically block, OR rules with very high priority (low number) can block
+        const hasGate = emissions.some(e => e.relationshipType === 'GATE');
+        if (hasGate || ruleRow.priority < 20) {
+          blockingRule = {
+            ruleId: ruleId.toString(),
+            ruleName: ruleRow.rule_name,
+            reason: hasGate 
+              ? `Rule "${ruleRow.rule_name}" requires gate condition`
+              : `High-priority rule "${ruleRow.rule_name}" blocked the request`
+          };
+          break; // Stop evaluation on blocking rule
+        }
+      }
+    }
+    
+    // Determine final decision
     const riskScore = context.signals?.risk_score || 0;
-    const allowed = riskScore < 0.8; // Simple threshold
+    const allowed = !blockingRule && riskScore < 0.8;
     
     res.json({
       allowed,
-      reason: allowed 
-        ? 'Allowed by policy (risk score below threshold)' 
-        : 'Blocked by policy (risk score too high)',
+      reason: blockingRule 
+        ? blockingRule.reason
+        : allowed 
+          ? `Allowed by policy (${matchedRules.length} rule(s) matched)`
+          : `Blocked by policy (risk score: ${riskScore.toFixed(2)})`,
       message: allowed ? 'Policy evaluation passed' : 'Policy evaluation failed',
-      riskScore
+      riskScore,
+      matchedRules: matchedRules.map(r => ({
+        ruleId: r.ruleId,
+        ruleName: r.ruleName,
+        priority: r.priority,
+        emissions: r.emissions
+      })),
+      blockingRule: blockingRule || undefined
     });
   } catch (error) {
     console.error('Error evaluating policy:', error);
@@ -2014,89 +2451,229 @@ app.post('/api/policy/evaluate', async (req, res) => {
   }
 });
 
-// Initialize Google Cloud Storage
-const storage = new Storage();
-const BUCKET_NAME = 'seedcore-designs-dev';
-
-// Upload design image to Google Cloud Storage
-app.post('/api/designs/upload', async (req, res) => {
+// POST /api/design/govern - Complete design governance workflow
+// Note: This endpoint calls the design governance service
+// For production, ensure TypeScript is compiled or use a JS version
+app.post('/api/design/govern', async (req, res) => {
   try {
-    const { imageUrl, runId, suffix } = req.body;
-
-    if (!imageUrl || !runId || !suffix) {
-      return res.status(400).json({ 
-        error: 'Missing required fields: imageUrl, runId, and suffix are required' 
-      });
+    const { designContext, snapshotId } = req.body;
+    
+    if (!designContext || !snapshotId) {
+      return res.status(400).json({ error: 'designContext and snapshotId are required' });
     }
-
-    if (!['print', 'mockup'].includes(suffix)) {
-      return res.status(400).json({ 
-        error: 'suffix must be either "print" or "mockup"' 
-      });
+    
+    // Get snapshot
+    const snapshotResult = await pool.query(
+      'SELECT id, version, env FROM pkg_snapshots WHERE id = $1',
+      [snapshotId]
+    );
+    
+    if (snapshotResult.rows.length === 0) {
+      return res.status(404).json({ error: `Snapshot ${snapshotId} not found` });
     }
-
-    const bucket = storage.bucket(BUCKET_NAME);
-    const fileName = `designs/${runId}-${suffix}.png`;
-    const file = bucket.file(fileName);
-
-    let buffer;
-
-    // Handle data URLs (base64)
-    if (imageUrl.startsWith('data:')) {
-      const base64Data = imageUrl.split(',')[1];
-      buffer = Buffer.from(base64Data, 'base64');
-    } else {
-      // Handle regular URLs (fetch from Gemini's temporary URL)
-      const response = await fetch(imageUrl);
-      const arrayBuffer = await response.arrayBuffer();
-      buffer = Buffer.from(arrayBuffer);
-    }
-
-    // Upload to GCS
-    // Note: With uniform bucket-level access enabled, we can't set per-object ACLs.
-    // Ensure the bucket has bucket-level IAM policy with allUsers having 
-    // roles/storage.objectViewer role for public read access.
-    await file.save(buffer, {
-      metadata: { contentType: 'image/png' },
+    
+    const snapshot = {
+      id: snapshotResult.rows[0].id,
+      version: snapshotResult.rows[0].version,
+      env: snapshotResult.rows[0].env,
+    };
+    
+    // For now, return a structured response indicating the service should be called from frontend
+    // In production, compile TypeScript or create a JS version of the service
+    res.json({
+      message: 'Design governance service available - call from frontend using designGovernanceService.ts',
+      snapshot: snapshot,
+      designContext: designContext,
+      note: 'See DESIGN_GOVERNANCE.md for integration instructions'
     });
-
-    // Return the permanent URL
-    const permanentUrl = `https://storage.googleapis.com/${BUCKET_NAME}/${fileName}`;
-    res.json({ url: permanentUrl });
+    
+    // TODO: Once TypeScript is compiled or JS version created, uncomment:
+    // const { governDesign } = await import('../services/designGovernanceService.js');
+    // const analysis = await governDesign(designContext, snapshot, `http://localhost:${PORT}`, process.env.GEMINI_API_KEY);
+    // res.json(analysis);
   } catch (error) {
-    console.error('Error uploading design to GCS:', error);
+    console.error('Error in design governance:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Submit manufacturing ticket (wearable design)
-app.post('/api/mfg/submit', async (req, res) => {
+// POST /api/validation/digital-twin - Step 5: Digital Twin validation
+app.post('/api/validation/digital-twin', async (req, res) => {
   try {
-    const ticket = req.body;
+    const { snapshotId } = req.body;
     
-    // Validate required fields
-    if (!ticket.ticketId || !ticket.runId || !ticket.design) {
-      return res.status(400).json({ 
-        error: 'Missing required fields: ticketId, runId, and design are required' 
-      });
+    if (!snapshotId) {
+      return res.status(400).json({ error: 'snapshotId is required' });
     }
-
-    // In a real system, you would save this to a database
-    // For now, we'll just log it and return success
-    console.log('[MFG] Manufacturing ticket submitted:', {
-      ticketId: ticket.ticketId,
-      runId: ticket.runId,
-      designConcept: ticket.design?.designConcept,
-      createdAt: ticket.createdAt,
+    
+    // Get snapshot
+    const snapshotResult = await pool.query(
+      'SELECT id, version, env FROM pkg_snapshots WHERE id = $1',
+      [snapshotId]
+    );
+    
+    if (snapshotResult.rows.length === 0) {
+      return res.status(404).json({ error: `Snapshot ${snapshotId} not found` });
+    }
+    
+    const snapshot = {
+      id: snapshotResult.rows[0].id,
+      version: snapshotResult.rows[0].version,
+      env: snapshotResult.rows[0].env,
+    };
+    
+    // Get rules for snapshot
+    const rulesResult = await pool.query(`
+      SELECT r.id, r.rule_name, r.priority, r.engine, r.disabled, r.rule_source
+      FROM pkg_policy_rules r
+      WHERE r.snapshot_id = $1 AND r.disabled = FALSE
+      ORDER BY r.priority ASC
+    `, [snapshotId]);
+    
+    // Get conditions and emissions for rules
+    const ruleIds = rulesResult.rows.map(r => r.id);
+    const conditionsResult = await pool.query(`
+      SELECT rule_id, condition_type, condition_key, operator, value, position
+      FROM pkg_rule_conditions
+      WHERE rule_id = ANY($1::uuid[])
+      ORDER BY rule_id, position
+    `, [ruleIds]);
+    
+    const emissionsResult = await pool.query(`
+      SELECT e.rule_id, e.subtask_type_id, e.relationship_type, e.params, e.position,
+             st.name as subtask_name
+      FROM pkg_rule_emissions e
+      JOIN pkg_subtask_types st ON e.subtask_type_id = st.id
+      WHERE e.rule_id = ANY($1::uuid[])
+      ORDER BY e.rule_id, e.position
+    `, [ruleIds]);
+    
+    // Build Rule objects
+    const conditionsByRule = new Map();
+    const emissionsByRule = new Map();
+    
+    conditionsResult.rows.forEach(row => {
+      if (!conditionsByRule.has(row.rule_id)) {
+        conditionsByRule.set(row.rule_id, []);
+      }
+      conditionsByRule.get(row.rule_id).push({
+        conditionType: row.condition_type,
+        conditionKey: row.condition_key,
+        operator: row.operator,
+        value: row.value,
+      });
     });
-
-    res.json({ 
-      success: true,
-      ticketId: ticket.ticketId,
-      message: 'Manufacturing ticket submitted successfully'
+    
+    emissionsResult.rows.forEach(row => {
+      if (!emissionsByRule.has(row.rule_id)) {
+        emissionsByRule.set(row.rule_id, []);
+      }
+      emissionsByRule.get(row.rule_id).push({
+        subtaskName: row.subtask_name,
+        relationshipType: row.relationship_type,
+        params: row.params,
+        position: row.position,
+      });
+    });
+    
+    const rules = rulesResult.rows.map(row => ({
+      id: row.id.toString(),
+      ruleName: row.rule_name,
+      priority: row.priority,
+      engine: row.engine,
+      disabled: row.disabled,
+      ruleSource: row.rule_source,
+      conditions: conditionsByRule.get(row.id) || [],
+      emissions: emissionsByRule.get(row.id) || [],
+    }));
+    
+    // Call Digital Twin validation service (frontend will handle this)
+    res.json({
+      message: 'Digital Twin validation - call from frontend using digitalTwinService.ts',
+      snapshot: snapshot,
+      rulesCount: rules.length,
+      note: 'See TRINITY_ENHANCEMENTS.md for integration instructions'
     });
   } catch (error) {
-    console.error('Error submitting manufacturing ticket:', error);
+    console.error('Error in digital twin validation:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/policy/evaluate-temporal - Step 6: Temporal policy evaluation
+app.post('/api/policy/evaluate-temporal', async (req, res) => {
+  try {
+    const { snapshotId, context, currentTime } = req.body;
+    
+    if (!snapshotId || !context) {
+      return res.status(400).json({ error: 'snapshotId and context are required' });
+    }
+    
+    const evalTime = currentTime || new Date().toISOString();
+    
+    // Get active facts at current time (temporal filtering)
+    const factsResult = await pool.query(`
+      SELECT 
+        id::text as id,
+        snapshot_id,
+        namespace,
+        subject,
+        predicate,
+        object_data as object,
+        valid_from,
+        valid_to,
+        created_by,
+        CASE
+          WHEN valid_to IS NULL THEN 'active'
+          WHEN valid_to > $1::timestamptz THEN 'active'
+          ELSE 'expired'
+        END as status
+      FROM facts
+      WHERE (valid_from IS NULL OR valid_from <= $1::timestamptz)
+        AND (valid_to IS NULL OR valid_to > $1::timestamptz)
+        AND snapshot_id = $2
+      ORDER BY valid_from DESC
+    `, [evalTime, snapshotId]);
+    
+    const temporalFacts = factsResult.rows.map(row => ({
+      id: row.id,
+      snapshotId: row.snapshot_id,
+      namespace: row.namespace,
+      subject: row.subject,
+      predicate: row.predicate,
+      object: row.object || {},
+      validFrom: row.valid_from?.toISOString(),
+      validTo: row.valid_to?.toISOString(),
+      status: row.status,
+      createdBy: row.created_by,
+    }));
+    
+    // Get rules
+    const rulesResult = await pool.query(`
+      SELECT r.id, r.rule_name, r.priority, r.disabled
+      FROM pkg_policy_rules r
+      WHERE r.snapshot_id = $1 AND r.disabled = FALSE
+      ORDER BY r.priority ASC
+    `, [snapshotId]);
+    
+    // Build evaluation context with temporal facts
+    const evaluationContext = {
+      currentTime: evalTime,
+      facts: temporalFacts,
+      tags: context.tags || {},
+      signals: context.signals || {},
+    };
+    
+    // Return context for frontend evaluation
+    res.json({
+      message: 'Temporal policy evaluation - call from frontend using temporalPolicyService.ts',
+      evaluationContext,
+      rulesCount: rulesResult.rows.length,
+      activeFactsCount: temporalFacts.length,
+      note: 'See TRINITY_ENHANCEMENTS.md for integration instructions'
+    });
+  } catch (error) {
+    console.error('Error in temporal policy evaluation:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -2136,8 +2713,10 @@ app.listen(PORT, () => {
   console.log(`   POST   /api/memory/append`);
   console.log(`   POST   /api/memory/promote`);
   console.log(`   POST   /api/policy/evaluate`);
-  console.log(`   POST   /api/designs/upload`);
-  console.log(`   POST   /api/mfg/submit`);
+  console.log(`   POST   /api/design/govern`);
+  console.log(`   POST   /api/validation/digital-twin`);
+  console.log(`   POST   /api/policy/evaluate-temporal`);
+  console.log(`   WS     /api/design/govern-stream`);
   const dbName = process.env.POSTGRES_DB || 'seedcore';
   console.log(`📊 Connected to PostgreSQL at ${process.env.POSTGRES_HOST || 'localhost'}:${process.env.POSTGRES_PORT || '5432'}/${dbName}`);
 });

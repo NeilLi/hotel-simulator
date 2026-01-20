@@ -1,5 +1,5 @@
-import React, { useEffect, useReducer, useState } from 'react';
-import { ArrowLeft, Sparkles, Shirt, Wand2, Download, Printer, Scissors, Layers, Loader2, ShieldAlert, ShieldCheck, ShieldX, CheckCircle2, X } from 'lucide-react';
+import React, { useEffect, useReducer, useState, useRef } from 'react';
+import { ArrowLeft, Sparkles, Shirt, Wand2, Download, Printer, Scissors, Layers, Loader2, ShieldAlert, ShieldCheck, ShieldX, CheckCircle2, X, Eye, Box } from 'lucide-react';
 import { wearableStudioService } from '../../services/wearableStudioService';
 import { seedcoreService } from '../../services/seedcoreService';
 import { PolicyDecision, WearableDesignDraft, WearableIntent, WearableTicket } from '../../services/wearableStudioTypes';
@@ -26,7 +26,9 @@ type StudioState = {
   designDraft: WearableDesignDraft | null;
   ticket: WearableTicket | null;
   error: string | null;
-  notification: { message: string; taskId?: string } | null;
+  notification: { message: string; taskId?: string; isError?: boolean } | null;
+  showPreview: boolean;
+  previewSnapshot: string | null;
 };
 
 type StudioAction =
@@ -37,7 +39,8 @@ type StudioAction =
   | { type: 'SET_RUN_ID'; runId: string | null }
   | { type: 'SET_TICKET'; ticket: WearableTicket | null }
   | { type: 'SET_ERROR'; error: string | null }
-  | { type: 'SET_NOTIFICATION'; notification: { message: string; taskId?: string } | null };
+  | { type: 'SET_NOTIFICATION'; notification: { message: string; taskId?: string; isError?: boolean } | null }
+  | { type: 'SET_PREVIEW'; show: boolean; snapshot?: string | null };
 
 const initialState: StudioState = {
   story: '',
@@ -51,6 +54,8 @@ const initialState: StudioState = {
   ticket: null,
   error: null,
   notification: null,
+  showPreview: false,
+  previewSnapshot: null,
 };
 
 function reducer(state: StudioState, action: StudioAction): StudioState {
@@ -71,14 +76,285 @@ function reducer(state: StudioState, action: StudioAction): StudioState {
       return { ...state, error: action.error };
     case 'SET_NOTIFICATION':
       return { ...state, notification: action.notification };
+    case 'SET_PREVIEW':
+      return { ...state, showPreview: action.show, previewSnapshot: action.snapshot || null };
     default:
       return state;
   }
 }
 
+// Mock RenderService: Simulates SeedCore emission processing for 3D Digital Twin
+class MockRenderService {
+  /**
+   * Mock: Process SeedCore emissions and generate precision mockup
+   * In production, this would use Three.js to render 3D scene
+   */
+  async processEmission(subtaskType: string, params: any, design: WearableDesignDraft, type: string): Promise<string> {
+    if (subtaskType === 'generate_precision_mockups') {
+      return await this.renderDigitalTwin(params, design, type);
+    }
+    throw new Error(`Unknown subtask type: ${subtaskType}`);
+  }
+
+  private async renderDigitalTwin(params: any, design: WearableDesignDraft, type: string): Promise<string> {
+    // Enhanced: Combine placement (print artwork) and production (mockup) images
+    // In production, this would:
+    // 1. Load 3D garment model (GLTF)
+    // 2. Apply artwork texture with precision placement
+    // 3. Apply warp profile and scale
+    // 4. Render scene and capture snapshot
+    
+    const { artwork_uri, placement_anchor, scale, warp_profile } = params;
+    
+    // Use production mockup as base (white garment template)
+    const mockupUrl = design.mockupImageUrl || design.imageUrl;
+    const printUrl = design.printImageUrl || design.imageUrl;
+    
+    return new Promise((resolve) => {
+      // Load both images
+      const mockupImg = new Image();
+      const printImg = new Image();
+      let mockupLoaded = false;
+      let printLoaded = false;
+      
+      const tryRender = () => {
+        if (!mockupLoaded || !printLoaded) return;
+        
+        // Get actual image dimensions (naturalWidth/Height are read-only, use width/height)
+        const mockupWidth = (mockupImg as any).naturalWidth || mockupImg.width || 800;
+        const mockupHeight = (mockupImg as any).naturalHeight || mockupImg.height || 1000;
+        const printWidth = (printImg as any).naturalWidth || printImg.width || 0;
+        const printHeight = (printImg as any).naturalHeight || printImg.height || 0;
+        
+        // Create canvas matching mockup dimensions with transparency support
+        const canvas = document.createElement('canvas');
+        canvas.width = mockupWidth;
+        canvas.height = mockupHeight;
+        const ctx = canvas.getContext('2d', { alpha: true })!;
+        
+        // Step 1: Draw production mockup (white garment template) as base
+        // Use fallback image if available, otherwise use mockupImg
+        const baseImg = (mockupImg as any).__fallbackImg || mockupImg;
+        ctx.drawImage(baseImg, 0, 0, canvas.width, canvas.height);
+        
+        // Step 2: Calculate placement position based on anchor (only if print image exists)
+        if (printWidth > 0 && printHeight > 0) {
+          const scaledWidth = printWidth * scale;
+          const scaledHeight = printHeight * scale;
+          
+          let placementX = 0;
+          let placementY = 0;
+          
+          if (placement_anchor === 'center_chest' || placement_anchor?.includes('front')) {
+            // Center horizontally, upper third vertically for chest placement
+            placementX = (canvas.width / 2) - (scaledWidth / 2);
+            placementY = (canvas.height * 0.35) - (scaledHeight / 2);
+          } else if (placement_anchor === 'center_back' || placement_anchor?.includes('back')) {
+            // Center horizontally, middle vertically for back placement
+            placementX = (canvas.width / 2) - (scaledWidth / 2);
+            placementY = (canvas.height * 0.5) - (scaledHeight / 2);
+          } else {
+            // Default: center
+            placementX = (canvas.width / 2) - (scaledWidth / 2);
+            placementY = (canvas.height / 2) - (scaledHeight / 2);
+          }
+          
+          // Step 3: Overlay print artwork onto mockup with precision placement
+          // Process print image to ensure transparent background
+          ctx.save();
+          
+          // Create a temporary canvas to process the print image and remove white backgrounds
+          const printCanvas = document.createElement('canvas');
+          printCanvas.width = printWidth;
+          printCanvas.height = printHeight;
+          const printCtx = printCanvas.getContext('2d', { 
+            willReadFrequently: true,
+            alpha: true // Ensure transparency support
+          })!;
+          
+          // Draw the print image with transparency preserved
+          printCtx.drawImage(printImg, 0, 0);
+          
+          // Process pixels to make white/light backgrounds transparent
+          // This ensures the print artwork blends seamlessly with the garment
+          const imageData = printCtx.getImageData(0, 0, printCanvas.width, printCanvas.height);
+          const data = imageData.data;
+          
+          // Thresholds for white background removal
+          const whiteThreshold = 235; // RGB values above this will be made transparent
+          const veryWhiteThreshold = 250; // Very white pixels become fully transparent
+          
+          for (let i = 0; i < data.length; i += 4) {
+            const r = data[i];
+            const g = data[i + 1];
+            const b = data[i + 2];
+            let alpha = data[i + 3];
+            
+            // Skip if already fully transparent
+            if (alpha === 0) continue;
+            
+            // Calculate average brightness
+            const avg = (r + g + b) / 3;
+            
+            // Check if pixel is white/light (potential background)
+            const isWhite = r > whiteThreshold && g > whiteThreshold && b > whiteThreshold;
+            
+            if (isWhite) {
+              if (avg > veryWhiteThreshold) {
+                // Very white pixels (likely background) - make fully transparent
+                data[i + 3] = 0;
+              } else {
+                // Near-white pixels - gradually fade to transparent
+                // This preserves subtle design elements while removing backgrounds
+                const whiteness = (avg - whiteThreshold) / (veryWhiteThreshold - whiteThreshold);
+                data[i + 3] = Math.max(0, Math.floor(alpha * (1 - whiteness * 0.95)));
+              }
+            }
+            // Otherwise, preserve original pixel (including existing transparency)
+          }
+          
+          // Put processed image data back
+          printCtx.putImageData(imageData, 0, 0);
+          
+          // Now overlay the processed print artwork onto mockup
+          // Use source-over to preserve transparency
+          ctx.globalCompositeOperation = 'source-over';
+          ctx.globalAlpha = 1.0; // Full opacity for the design (transparency already handled)
+          
+          // Draw the processed print image at calculated position
+          ctx.drawImage(
+            printCanvas,
+            placementX,
+            placementY,
+            scaledWidth,
+            scaledHeight
+          );
+          
+          ctx.restore();
+        }
+        
+        // Step 4: Add metadata overlay (optional, can be removed for cleaner preview)
+        ctx.save();
+        ctx.fillStyle = 'rgba(59, 130, 246, 0.9)';
+        ctx.font = 'bold 11px sans-serif';
+        ctx.fillText(`Anchor: ${placement_anchor}`, 12, 28);
+        ctx.fillText(`Scale: ${scale}`, 12, 46);
+        ctx.fillText(`Warp: ${warp_profile}`, 12, 64);
+        ctx.restore();
+        
+        resolve(canvas.toDataURL('image/png'));
+      };
+      
+      // Load mockup image (production - white garment template)
+      mockupImg.crossOrigin = 'anonymous';
+      mockupImg.onload = () => {
+        mockupLoaded = true;
+        tryRender();
+      };
+      mockupImg.onerror = () => {
+        // Fallback: create white garment base if mockup fails
+        const fallbackCanvas = document.createElement('canvas');
+        fallbackCanvas.width = 800;
+        fallbackCanvas.height = 1000;
+        const fallbackCtx = fallbackCanvas.getContext('2d')!;
+        fallbackCtx.fillStyle = '#ffffff';
+        fallbackCtx.fillRect(0, 0, fallbackCanvas.width, fallbackCanvas.height);
+        
+        // Draw simple garment outline
+        fallbackCtx.strokeStyle = '#e2e8f0';
+        fallbackCtx.lineWidth = 2;
+        fallbackCtx.beginPath();
+        fallbackCtx.moveTo(200, 100);
+        fallbackCtx.lineTo(200, 900);
+        fallbackCtx.lineTo(600, 900);
+        fallbackCtx.lineTo(600, 100);
+        fallbackCtx.closePath();
+        fallbackCtx.stroke();
+        
+        // Use fallback canvas directly - create image from it
+        const fallbackDataUrl = fallbackCanvas.toDataURL('image/png');
+        const fallbackImg = new Image();
+        fallbackImg.onload = () => {
+          // Store fallback image reference for rendering
+          mockupImg.width = fallbackCanvas.width;
+          mockupImg.height = fallbackCanvas.height;
+          (mockupImg as any).__fallbackImg = fallbackImg;
+          mockupLoaded = true;
+          tryRender();
+        };
+        fallbackImg.src = fallbackDataUrl;
+      };
+      
+      // Load print artwork (placement image)
+      printImg.crossOrigin = 'anonymous';
+      printImg.onload = () => {
+        printLoaded = true;
+        tryRender();
+      };
+      printImg.onerror = () => {
+        // If print image fails, still render mockup only
+        printLoaded = true;
+        printImg.width = 0;
+        printImg.height = 0;
+        tryRender();
+      };
+      
+      // Start loading images
+      if (mockupUrl) {
+        mockupImg.src = mockupUrl;
+      } else {
+        // Trigger error handler to create fallback
+        const errorEvent = new Event('error');
+        mockupImg.dispatchEvent(errorEvent);
+      }
+      
+      if (printUrl) {
+        printImg.src = printUrl;
+      } else {
+        // No print URL - render mockup only
+        printLoaded = true;
+        printImg.width = 0;
+        printImg.height = 0;
+      }
+    });
+  }
+}
+
+// Mock SeedCore API: Simulates SeedCore emission response
+async function mockSeedCoreEvaluate(design: WearableDesignDraft, intent: WearableIntent): Promise<any> {
+  // Simulate SeedCore policy evaluation and emission generation
+  return {
+    policy_decision: {
+      allowed: true,
+      reason: "Design meets all safety and quality standards"
+    },
+    emissions: [
+      {
+        subtask_type: "generate_precision_mockups",
+        position: 0,
+        params: {
+          artwork_uri: design.printImageUrl || design.imageUrl || '',
+          placement_anchor: design.printSpec?.placement?.toLowerCase().includes('front') ? 'center_chest' : 'center_back',
+          scale: 0.45,
+          warp_profile: design.fabricType.toLowerCase().includes('cotton') ? 'loose_cotton' : 'standard'
+        }
+      },
+      {
+        subtask_type: "fabricate_part",
+        position: 1,
+        params: {
+          machine_id: "robot_arm_01",
+          ink_set: "cmyk_v4"
+        }
+      }
+    ]
+  };
+}
+
 export function WearableStoryStudio({ onBack }: Props) {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [state, dispatch] = useReducer(reducer, initialState);
+  const renderService = useRef(new MockRenderService());
 
   useEffect(() => {
     let active = true;
@@ -165,6 +441,50 @@ export function WearableStoryStudio({ onBack }: Props) {
       console.error(e);
       dispatch({ type: 'SET_STATUS', status: 'error' });
       dispatch({ type: 'SET_ERROR', error: 'Failed to generate design. Please try again.' });
+    }
+  };
+
+  const handlePreview = async () => {
+    if (!state.designDraft) {
+      dispatch({ type: 'SET_ERROR', error: 'No design draft available. Please generate a design first.' });
+      return;
+    }
+
+    dispatch({ type: 'SET_STATUS', status: 'generating' });
+    dispatch({ type: 'SET_PREVIEW', show: true, snapshot: null });
+
+    try {
+      // Mock SeedCore evaluation
+      const seedcoreResponse = await mockSeedCoreEvaluate(state.designDraft, intent);
+      
+      if (!seedcoreResponse.policy_decision.allowed) {
+        dispatch({ type: 'SET_ERROR', error: seedcoreResponse.policy_decision.reason });
+        dispatch({ type: 'SET_PREVIEW', show: false });
+        return;
+      }
+
+      // Process emissions through mock RenderService
+      let previewSnapshot: string | null = null;
+      
+      for (const emission of seedcoreResponse.emissions) {
+        if (emission.subtask_type === 'generate_precision_mockups') {
+          previewSnapshot = await renderService.current.processEmission(
+            emission.subtask_type,
+            emission.params,
+            state.designDraft,
+            state.type
+          );
+          break;
+        }
+      }
+
+      dispatch({ type: 'SET_PREVIEW', show: true, snapshot: previewSnapshot });
+      dispatch({ type: 'SET_STATUS', status: 'review' });
+    } catch (error) {
+      console.error('Preview generation failed:', error);
+      dispatch({ type: 'SET_ERROR', error: 'Failed to generate preview. Please try again.' });
+      dispatch({ type: 'SET_PREVIEW', show: false });
+      dispatch({ type: 'SET_STATUS', status: 'error' });
     }
   };
 
@@ -288,9 +608,27 @@ export function WearableStoryStudio({ onBack }: Props) {
               } else {
                 console.warn('SeedCore vision task response invalid:', task);
               }
-            } catch (visionError) {
+            } catch (visionError: any) {
               console.warn('Vision task creation failed, trying regular task:', visionError);
-              // Fall through to regular task
+              
+              // Check if it's a server initialization error - if so, don't try fallback
+              const errorMessage = visionError?.message || String(visionError);
+              const isServerError = 
+                errorMessage === 'SERVER_NOT_INITIALIZED' ||
+                errorMessage === 'SERVER_NOT_RUNNING' ||
+                (typeof errorMessage === 'string' && (
+                  errorMessage.includes('snapshot_id') ||
+                  errorMessage.includes('null value') ||
+                  errorMessage.includes('violates not-null constraint') ||
+                  errorMessage.includes('Failed to fetch') ||
+                  errorMessage.includes('ECONNREFUSED')
+                ));
+              
+              if (isServerError) {
+                // Re-throw to be caught by outer catch block
+                throw visionError;
+              }
+              // Fall through to regular task for other errors
             }
           }
           
@@ -335,29 +673,60 @@ export function WearableStoryStudio({ onBack }: Props) {
             }
           }
 
-          // Auto-hide notification after 5 seconds
-          setTimeout(() => {
-            dispatch({ type: 'SET_NOTIFICATION', notification: null });
-          }, 5000);
-        } catch (seedcoreError) {
+          // Auto-hide notification after 5 seconds (only if no error occurred)
+          // Error handling will set its own timeout
+          if (taskCreated || (!taskCreated && imageUrl)) {
+            setTimeout(() => {
+              dispatch({ type: 'SET_NOTIFICATION', notification: null });
+            }, 5000);
+          }
+        } catch (seedcoreError: any) {
           // SeedCore is optional - ticket is already created
           console.error('SeedCore task creation failed (non-critical):', seedcoreError);
-          // Update notification to be more user-friendly
-          dispatch({ 
-            type: 'SET_NOTIFICATION', 
-            notification: { 
-              message: `Your design has been sent to production!`,
-            } 
-          });
+          
+          // Check for server initialization errors
+          const errorMessage = seedcoreError?.message || String(seedcoreError);
+          const isServerError = 
+            errorMessage === 'SERVER_NOT_INITIALIZED' ||
+            errorMessage === 'SERVER_NOT_RUNNING' ||
+            (typeof errorMessage === 'string' && (
+              errorMessage.includes('snapshot_id') ||
+              errorMessage.includes('null value') ||
+              errorMessage.includes('violates not-null constraint') ||
+              errorMessage.includes('Failed to fetch') ||
+              errorMessage.includes('ECONNREFUSED')
+            ));
+          
+          if (isServerError) {
+            // Show user-friendly message about server not being started
+            dispatch({ 
+              type: 'SET_NOTIFICATION', 
+              notification: { 
+                message: `Server not initialized. Please ensure the database server is running and properly configured.`,
+                isError: true,
+              } 
+            });
+            // Auto-hide after 8 seconds for server errors (longer than normal)
+            setTimeout(() => {
+              dispatch({ type: 'SET_NOTIFICATION', notification: null });
+            }, 8000);
+          } else {
+            // Update notification to be more user-friendly for other errors
+            dispatch({ 
+              type: 'SET_NOTIFICATION', 
+              notification: { 
+                message: `Your design has been sent to production!`,
+              } 
+            });
+            // Auto-hide after 5 seconds
+            setTimeout(() => {
+              dispatch({ type: 'SET_NOTIFICATION', notification: null });
+            }, 5000);
+          }
         }
       })();
 
-      // Always set status to done and auto-hide notification
-      dispatch({ type: 'SET_STATUS', status: 'done' });
-      setTimeout(() => {
-        dispatch({ type: 'SET_NOTIFICATION', notification: null });
-      }, 5000);
-
+      // Set status to done (duplicate removed)
       dispatch({ type: 'SET_STATUS', status: 'done' });
 
       await wearableStudioService.appendMemory({
@@ -397,20 +766,143 @@ export function WearableStoryStudio({ onBack }: Props) {
 
   return (
     <div className="w-full h-full bg-[#FAFAFA] text-slate-900 flex flex-col">
+      {/* --- PREVIEW MODAL --- */}
+      {state.showPreview && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm animate-in fade-in duration-300 p-2 md:p-4">
+          <div className="relative w-full max-w-6xl h-[95vh] bg-white rounded-3xl shadow-2xl overflow-hidden animate-in zoom-in-95 duration-300 flex flex-col">
+            {/* Header - Compact */}
+            <div className="flex-shrink-0 flex items-center justify-between p-4 md:p-5 border-b border-slate-200 bg-gradient-to-r from-blue-50 to-indigo-50">
+              <div className="flex items-center gap-2 md:gap-3">
+                <Box className="text-blue-600" size={20} />
+                <div>
+                  <h2 className="text-lg md:text-xl font-black text-slate-900">3D Digital Twin Preview</h2>
+                  <p className="text-[10px] md:text-xs text-slate-500 font-medium">SeedCore Precision Mockup</p>
+                </div>
+              </div>
+              <button
+                onClick={() => dispatch({ type: 'SET_PREVIEW', show: false })}
+                className="p-2 rounded-full hover:bg-white/80 text-slate-500 hover:text-slate-900 transition-colors"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            {/* Preview Content */}
+            <div className="flex-1 overflow-y-auto p-3 md:p-4">
+              {state.previewSnapshot ? (
+                <div className="h-full flex flex-col gap-3 md:gap-4">
+                  {/* Rendered Preview - Maximized for image display */}
+                  <div className="flex-1 flex flex-col min-h-0 bg-gradient-to-br from-slate-50 to-slate-100 rounded-xl md:rounded-2xl p-3 md:p-4 border border-slate-200">
+                    <div className="flex-shrink-0 flex items-center justify-between mb-2 md:mb-3">
+                      <div className="text-[10px] md:text-xs font-bold uppercase tracking-widest text-slate-400">Rendered Snapshot</div>
+                      <div className="px-2 md:px-3 py-0.5 md:py-1 bg-emerald-100 text-emerald-700 text-[10px] md:text-xs font-bold rounded-full">
+                        Pre-Production QA Ready
+                      </div>
+                    </div>
+                    {/* Image Container - Maximized space for larger image */}
+                    <div className="flex-1 flex items-center justify-center min-h-0 overflow-auto">
+                      <div className="w-full h-full flex items-center justify-center">
+                        <img
+                          src={state.previewSnapshot}
+                          alt="3D Digital Twin Preview"
+                          className="max-w-[95%] max-h-[95%] w-auto h-auto object-contain rounded-lg md:rounded-xl shadow-2xl border-2 md:border-4 border-white"
+                          style={{ imageRendering: 'auto' }}
+                        />
+                      </div>
+                    </div>
+                    {/* Metadata overlay - Compact at bottom */}
+                    <div className="flex-shrink-0 mt-2 md:mt-3 flex flex-wrap gap-1.5 md:gap-2 text-[10px] md:text-xs">
+                      <div className="px-2 md:px-3 py-1 md:py-1.5 bg-blue-600/90 text-white rounded-md md:rounded-lg font-semibold">
+                        Anchor: {state.designDraft?.printSpec?.placement?.toLowerCase() || 'center_chest'}
+                      </div>
+                      <div className="px-2 md:px-3 py-1 md:py-1.5 bg-blue-600/90 text-white rounded-md md:rounded-lg font-semibold">
+                        Scale: 0.45
+                      </div>
+                      <div className="px-2 md:px-3 py-1 md:py-1.5 bg-blue-600/90 text-white rounded-md md:rounded-lg font-semibold">
+                        Warp: {state.designDraft?.fabricType.toLowerCase().includes('cotton') ? 'loose_cotton' : 'standard'}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Emission Details - Very compact, minimal space */}
+                  <div className="flex-shrink-0 grid grid-cols-2 md:grid-cols-4 gap-2">
+                    <div className="p-2 bg-blue-50 rounded-lg border border-blue-100">
+                      <div className="text-[9px] font-bold uppercase tracking-widest text-blue-600 mb-0.5">Placement Anchor</div>
+                      <div className="text-[10px] font-semibold text-slate-900">
+                        {state.designDraft?.printSpec?.placement || 'center_chest'}
+                      </div>
+                    </div>
+                    <div className="p-2 bg-indigo-50 rounded-lg border border-indigo-100">
+                      <div className="text-[9px] font-bold uppercase tracking-widest text-indigo-600 mb-0.5">Scale Factor</div>
+                      <div className="text-[10px] font-semibold text-slate-900">0.45</div>
+                    </div>
+                    <div className="p-2 bg-purple-50 rounded-lg border border-purple-100">
+                      <div className="text-[9px] font-bold uppercase tracking-widest text-purple-600 mb-0.5">Warp Profile</div>
+                      <div className="text-[10px] font-semibold text-slate-900">
+                        {state.designDraft?.fabricType.toLowerCase().includes('cotton') ? 'loose_cotton' : 'standard'}
+                      </div>
+                    </div>
+                    <div className="p-2 bg-emerald-50 rounded-lg border border-emerald-100">
+                      <div className="text-[9px] font-bold uppercase tracking-widest text-emerald-600 mb-0.5">Status</div>
+                      <div className="text-[10px] font-semibold text-slate-900">Ready</div>
+                    </div>
+                  </div>
+
+                  {/* Info Note - Compact */}
+                  <div className="flex-shrink-0 p-2 md:p-3 bg-slate-50 rounded-lg border border-slate-200">
+                    <p className="text-[10px] md:text-xs text-slate-600 leading-relaxed">
+                      <strong className="font-bold">Mock SeedCore Integration:</strong> This preview simulates the SeedCore emission processing flow. 
+                      In production, this would render a full 3D scene using Three.js with precise UV mapping and warp profiles 
+                      for deterministic manufacturing alignment.
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex flex-col items-center justify-center py-20">
+                  <Loader2 className="text-blue-600 animate-spin mb-4" size={48} />
+                  <p className="text-sm font-semibold text-slate-600">Generating 3D Digital Twin...</p>
+                  <p className="text-xs text-slate-400 mt-2">Processing SeedCore emissions</p>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* --- NOTIFICATION POPUP --- */}
       {state.notification && (
         <div className="fixed top-4 right-4 z-50 animate-in slide-in-from-right fade-in duration-300 pointer-events-auto">
-          <div className="bg-emerald-50 border border-emerald-200 rounded-xl shadow-xl p-4 max-w-md flex items-start gap-3">
-            <CheckCircle2 className="text-emerald-600 flex-shrink-0 mt-0.5" size={20} />
+          <div className={`rounded-xl shadow-xl p-4 max-w-md flex items-start gap-3 ${
+            state.notification.isError 
+              ? 'bg-amber-50 border border-amber-200' 
+              : 'bg-emerald-50 border border-emerald-200'
+          }`}>
+            {state.notification.isError ? (
+              <ShieldAlert className="text-amber-600 flex-shrink-0 mt-0.5" size={20} />
+            ) : (
+              <CheckCircle2 className="text-emerald-600 flex-shrink-0 mt-0.5" size={20} />
+            )}
             <div className="flex-1">
-              <p className="text-sm font-semibold text-emerald-900">{state.notification.message}</p>
+              <p className={`text-sm font-semibold ${
+                state.notification.isError ? 'text-amber-900' : 'text-emerald-900'
+              }`}>
+                {state.notification.message}
+              </p>
               {state.notification.taskId && (
-                <p className="text-xs text-emerald-600 mt-2 opacity-70">Reference: {state.notification.taskId.slice(0, 8)}...</p>
+                <p className={`text-xs mt-2 opacity-70 ${
+                  state.notification.isError ? 'text-amber-600' : 'text-emerald-600'
+                }`}>
+                  Reference: {state.notification.taskId.slice(0, 8)}...
+                </p>
               )}
             </div>
             <button
               onClick={() => dispatch({ type: 'SET_NOTIFICATION', notification: null })}
-              className="text-emerald-600 hover:text-emerald-800 transition-colors flex-shrink-0"
+              className={`transition-colors flex-shrink-0 ${
+                state.notification.isError 
+                  ? 'text-amber-600 hover:text-amber-800' 
+                  : 'text-emerald-600 hover:text-emerald-800'
+              }`}
             >
               <X size={16} />
             </button>
@@ -485,36 +977,46 @@ export function WearableStoryStudio({ onBack }: Props) {
          </div>
 
          {/* RIGHT: PREVIEW PANEL */}
-         <div className="lg:col-span-8 bg-white relative p-8 flex flex-col items-center justify-center overflow-y-auto">
+         <div className="lg:col-span-8 bg-white relative flex flex-col overflow-hidden">
              {/* Background Pattern - pointer-events-none so it doesn't block clicks */}
              <div className="absolute inset-0 opacity-[0.03] pointer-events-none" style={{ backgroundImage: 'radial-gradient(#cbd5e1 1px, transparent 1px)', backgroundSize: '24px 24px' }} />
              
             {state.designDraft ? (
-                <div className="w-full max-w-3xl animate-in fade-in slide-in-from-bottom-8 duration-700">
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-8 items-start">
-                        
-                        <DesignPreview design={state.designDraft} type={state.type} />
+                <div className="flex-1 overflow-y-auto p-8">
+                    <div className="w-full max-w-3xl mx-auto animate-in fade-in slide-in-from-bottom-8 duration-700">
+                        {/* Top Action Bar - Preview Button */}
+                        <div className="mb-6 flex justify-end">
+                            <PreviewButton
+                                onClick={handlePreview}
+                                disabled={!state.designDraft || isBusy}
+                            />
+                        </div>
 
-                        <div className="space-y-6">
-                           <ProductionTicket
-                             design={state.designDraft}
-                             runId={state.runId}
-                             ticket={state.ticket}
-                           />
-                           <ActionsBar
-                             disabled={!state.policyDecision?.allowed || isBusy}
-                             submitting={state.status === 'submitting'}
-                             onSubmit={() => {
-                               console.log('[WearableStudio] ActionsBar onSubmit called', {
-                                 policyDecision: state.policyDecision,
-                                 allowed: state.policyDecision?.allowed,
-                                 isBusy,
-                               });
-                               handleSubmit().catch((error) => {
-                                 console.error('[WearableStudio] Unhandled error in handleSubmit:', error);
-                               });
-                             }}
-                           />
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-8 items-start">
+                            
+                            <DesignPreview design={state.designDraft} type={state.type} />
+
+                            <div className="space-y-6">
+                               <ProductionTicket
+                                 design={state.designDraft}
+                                 runId={state.runId}
+                                 ticket={state.ticket}
+                               />
+                               <ActionsBar
+                                 disabled={!state.policyDecision?.allowed || isBusy}
+                                 submitting={state.status === 'submitting'}
+                                 onSubmit={() => {
+                                   console.log('[WearableStudio] ActionsBar onSubmit called', {
+                                     policyDecision: state.policyDecision,
+                                     allowed: state.policyDecision?.allowed,
+                                     isBusy,
+                                   });
+                                   handleSubmit().catch((error) => {
+                                     console.error('[WearableStudio] Unhandled error in handleSubmit:', error);
+                                   });
+                                 }}
+                               />
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -655,7 +1157,7 @@ function PolicyStatusPanel(props: { snapshot: Snapshot | null; decision: PolicyD
 }
 
 function DesignPreview({ design, type }: { design: WearableDesignDraft; type: string }) {
-  const [view, setView] = useState<'production' | 'placement'>('production');
+  const [view, setView] = useState<'production' | 'placement'>('placement');
 
   const getGarmentSVG = () => {
     const printAreaId = `print-area-${Math.random().toString(36).slice(2, 11)}`;
@@ -823,14 +1325,6 @@ function DesignPreview({ design, type }: { design: WearableDesignDraft; type: st
             <div className="text-[10px] font-bold uppercase tracking-widest text-slate-400">Preview</div>
             <div className="inline-flex rounded-xl border border-slate-200 bg-slate-50 p-1">
               <button
-                onClick={() => setView('production')}
-                className={`px-3 py-1 text-[10px] font-extrabold uppercase tracking-widest rounded-lg transition-colors ${
-                  view === 'production' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'
-                }`}
-              >
-                Production
-              </button>
-              <button
                 onClick={() => setView('placement')}
                 className={`px-3 py-1 text-[10px] font-extrabold uppercase tracking-widest rounded-lg transition-colors ${
                   view === 'placement' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'
@@ -838,21 +1332,18 @@ function DesignPreview({ design, type }: { design: WearableDesignDraft; type: st
               >
                 Placement
               </button>
+              <button
+                onClick={() => setView('production')}
+                className={`px-3 py-1 text-[10px] font-extrabold uppercase tracking-widest rounded-lg transition-colors ${
+                  view === 'production' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'
+                }`}
+              >
+                Production
+              </button>
             </div>
           </div>
 
-          {view === 'production' ? (
-            <div className="relative w-full aspect-[3/4] rounded-2xl overflow-hidden bg-white border border-slate-100">
-              <img
-                src={design.mockupImageUrl || design.imageUrl || undefined}
-                alt="Production mockup"
-                className="w-full h-full object-contain p-4"
-              />
-              <div className="absolute top-3 left-3 bg-emerald-600/90 text-white text-[10px] font-bold uppercase tracking-widest px-3 py-1 rounded-full">
-                Production Mockup
-              </div>
-            </div>
-          ) : (
+          {view === 'placement' ? (
             <div className="w-full">
               <div className="mx-auto w-full max-w-2xl">
                 <img
@@ -863,6 +1354,17 @@ function DesignPreview({ design, type }: { design: WearableDesignDraft; type: st
               </div>
               <div className="mt-2 text-center text-[10px] font-bold uppercase tracking-widest text-slate-500">
                 {design.printSpec?.placement || 'FRONT'}
+              </div>
+            </div>
+          ) : (
+            <div className="relative w-full aspect-[3/4] rounded-2xl overflow-hidden bg-white border border-slate-100">
+              <img
+                src={design.mockupImageUrl || design.imageUrl || undefined}
+                alt="Production mockup"
+                className="w-full h-full object-contain p-4"
+              />
+              <div className="absolute top-3 left-3 bg-emerald-600/90 text-white text-[10px] font-bold uppercase tracking-widest px-3 py-1 rounded-full">
+                Production Mockup
               </div>
             </div>
           )}
@@ -911,6 +1413,31 @@ function ProductionTicket({ design, runId, ticket }: { design: WearableDesignDra
         </div>
       </div>
     </div>
+  );
+}
+
+function PreviewButton({ 
+  onClick, 
+  disabled 
+}: { 
+  onClick: () => void; 
+  disabled: boolean;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      type="button"
+      className={`px-6 py-3 rounded-xl font-bold uppercase tracking-widest text-xs transition-all flex items-center justify-center gap-2 ${
+        disabled
+          ? 'bg-slate-100 text-slate-400 cursor-not-allowed border border-slate-200'
+          : 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white hover:from-blue-700 hover:to-indigo-700 shadow-lg shadow-blue-200 hover:shadow-blue-300 border border-blue-500 hover:scale-105 active:scale-95'
+      }`}
+      title={disabled ? 'Generate a design first to preview' : 'Preview 3D Digital Twin'}
+    >
+      <Eye size={18} />
+      Preview 3D Digital Twin
+    </button>
   );
 }
 

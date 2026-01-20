@@ -1,10 +1,14 @@
-import React, { useState, useRef } from 'react';
-import { ArrowLeft, Compass, Video, Upload, Play, Film, Loader2, Sparkles, Map } from 'lucide-react';
+import React, { useState, useRef, useEffect } from 'react';
+import { ArrowLeft, Compass, Video, Upload, Play, Film, Loader2, Sparkles, Map, ShieldAlert, ShieldCheck, ShieldX } from 'lucide-react';
 import { geminiService } from '../../services/geminiService';
+import { wearableStudioService } from '../../services/wearableStudioService';
+import type { PolicyDecision } from '../../services/wearableStudioTypes';
 
 interface Props {
   onBack: () => void;
 }
+
+type Snapshot = { id: number; version: string; env: string; isActive: boolean };
 
 export function JourneyStudio({ onBack }: Props) {
   const [story, setStory] = useState("");
@@ -13,8 +17,31 @@ export function JourneyStudio({ onBack }: Props) {
   const [isGeneratingVideo, setIsGeneratingVideo] = useState(false);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
+  const [policyDecision, setPolicyDecision] = useState<PolicyDecision | null>(null);
+  const [policyStatus, setPolicyStatus] = useState<'idle' | 'checking' | 'checked'>('idle');
+  const [policyError, setPolicyError] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    let active = true;
+    wearableStudioService.getActiveSnapshot()
+      .then((snap) => {
+        if (active) {
+          setSnapshot(snap as Snapshot | null);
+        }
+      })
+      .catch((error) => {
+        console.warn("Failed to load snapshot", error);
+        if (active) {
+          setSnapshot(null);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -35,9 +62,46 @@ export function JourneyStudio({ onBack }: Props) {
     setIsGeneratingVideo(true);
     setVideoUrl(null);
     setErrorMsg(null);
+    setPolicyError(null);
     setEnrichmentStatus("ENRICHING");
 
     try {
+      // Policy check before generating video
+      setPolicyStatus('checking');
+      
+      const policyContext = {
+        tags: [
+          "scene=journey_studio",
+          "action=generate_video",
+          "content_type=travel_story",
+        ],
+        signals: {
+          risk_score: Math.min(story.length / 1000, 1),
+          content_category: "video_generation",
+          age_rating: "general",
+          region: "global",
+          device: "router",
+        },
+        values: {
+          story_length: story.length,
+          has_image: !!selectedImage,
+          persona: "guest",
+        },
+        snapshot: snapshot
+          ? { snapshotId: snapshot.id, version: snapshot.version, env: snapshot.env }
+          : undefined,
+      };
+
+      const decision = await wearableStudioService.evaluatePolicy(snapshot?.id, policyContext);
+      setPolicyDecision(decision);
+      setPolicyStatus('checked');
+
+      if (decision.blocked) {
+        setPolicyError(decision.reasons[0] || 'Policy blocked this request.');
+        setIsGeneratingVideo(false);
+        return;
+      }
+
       // 1. Backend Service Call (Simulated): Enrich Context
       const richPrompt = await geminiService.constructJourneyContext(story);
       setEnrichmentStatus("DONE");
@@ -52,9 +116,10 @@ export function JourneyStudio({ onBack }: Props) {
       }
     } catch (e) {
       console.error(e);
-      setErrorMsg("An unexpected error occurred during the journey.");
+      setErrorMsg(e instanceof Error ? e.message : "An unexpected error occurred during the journey.");
     } finally {
       setIsGeneratingVideo(false);
+      setPolicyStatus('idle');
     }
   };
 
@@ -145,22 +210,81 @@ export function JourneyStudio({ onBack }: Props) {
 
                <hr className="border-slate-200" />
 
+               {/* Policy Status Panel */}
+               <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+                 <div className="flex items-center justify-between mb-2">
+                   <div className="text-[10px] uppercase tracking-widest font-bold text-slate-400">Policy Gate</div>
+                   {policyStatus === 'checking' ? (
+                     <div className="flex items-center gap-2 text-xs font-bold text-amber-600">
+                       <ShieldAlert size={14} className="animate-pulse" />
+                       Checking...
+                     </div>
+                   ) : policyDecision?.blocked ? (
+                     <div className="flex items-center gap-2 text-xs font-bold text-red-600">
+                       <ShieldX size={14} />
+                       Blocked
+                     </div>
+                   ) : policyDecision?.allowed ? (
+                     <div className="flex items-center gap-2 text-xs font-bold text-emerald-600">
+                       <ShieldCheck size={14} />
+                       Allowed
+                     </div>
+                   ) : (
+                     <div className="flex items-center gap-2 text-xs font-bold text-slate-400">
+                       <ShieldAlert size={14} />
+                       Pending
+                     </div>
+                   )}
+                 </div>
+                 <div className="mt-3 space-y-2 text-xs text-slate-600 font-medium">
+                   <div>
+                     Snapshot: <span className="font-bold text-slate-800">{snapshot?.version || 'unavailable'}</span>
+                   </div>
+                   {policyError && (
+                     <div className="text-xs text-red-600 font-medium bg-red-50 p-2 rounded-lg">
+                       {policyError}
+                     </div>
+                   )}
+                   {policyDecision?.reasons?.length ? (
+                     <div className="text-[11px] text-slate-500">
+                       {policyDecision.reasons.slice(0, 2).join(' · ')}
+                     </div>
+                   ) : policyStatus === 'idle' ? (
+                     <div className="text-[11px] text-slate-400">Policy evaluation ready.</div>
+                   ) : null}
+                   {policyDecision?.ruleHits?.length ? (
+                     <div className="text-[10px] text-slate-400 uppercase tracking-widest">
+                       Hits: {policyDecision.ruleHits.slice(0, 3).map((hit) => hit.ruleName).join(', ')}
+                     </div>
+                   ) : null}
+                 </div>
+               </div>
+
                {/* Action */}
                <div className="space-y-4">
                   <button
                      onClick={handleGenerate}
-                     disabled={!story.trim() || !selectedImage || isGeneratingVideo}
+                     disabled={!story.trim() || !selectedImage || isGeneratingVideo || (policyDecision?.blocked === true)}
                      className="w-full py-5 bg-gradient-to-r from-indigo-600 to-purple-600 text-white rounded-2xl font-bold uppercase tracking-widest shadow-xl shadow-indigo-200 hover:shadow-indigo-300 hover:scale-[1.02] active:scale-95 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-3"
                   >
-                     {isGeneratingVideo ? <Loader2 size={18} className="animate-spin" /> : <Video size={18} />}
-                     {isGeneratingVideo ? "Directing Scene..." : "Generate Journey Video"}
+                     {isGeneratingVideo ? (
+                       <>
+                         <Loader2 size={18} className="animate-spin" />
+                         {policyStatus === 'checking' ? 'Checking Policy...' : 'Directing Scene...'}
+                       </>
+                     ) : (
+                       <>
+                         <Video size={18} />
+                         Generate Journey Video
+                       </>
+                     )}
                   </button>
                   
                   {isGeneratingVideo && (
                      <div className="bg-indigo-50 border border-indigo-100 rounded-lg p-3 flex items-center gap-3">
                         <Sparkles size={14} className="text-indigo-500 animate-pulse" />
                         <span className="text-[10px] font-bold uppercase tracking-wide text-indigo-700">
-                           {enrichmentStatus === "ENRICHING" ? "Enriching Narrative Context..." : "Synthesizing Video Frames..."}
+                           {policyStatus === 'checking' ? "Checking Policy..." : enrichmentStatus === "ENRICHING" ? "Enriching Narrative Context..." : "Synthesizing Video Frames..."}
                         </span>
                      </div>
                   )}

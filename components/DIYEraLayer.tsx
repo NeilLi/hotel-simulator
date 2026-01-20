@@ -15,6 +15,7 @@ import {
 import { WearableStoryStudio } from "./DIYEra/WearableStoryStudio";
 import { MagicAtelier } from "./DIYEra/MagicAtelier";
 import { JourneyStudio } from "./DIYEra/JourneyStudio";
+import { GiftForgePage } from "./DIYEra/GiftForgePage";
 
 /**
  * DIY Era — Creative Studio Scene
@@ -476,6 +477,7 @@ export function DIYEraLuxPortal({
     if (focus === "WEAR") setActiveModule("WEAR");
     if (focus === "KIDS") setActiveModule("KIDS");
     if (focus === "JOURNEY") setActiveModule("JOURNEY");
+    if (focus === "GIFT") setActiveModule("GIFT");
     if (onEnterZone) onEnterZone(focus);
   };
 
@@ -484,6 +486,7 @@ export function DIYEraLuxPortal({
     if (id === "WEAR") setActiveModule("WEAR");
     if (id === "KIDS") setActiveModule("KIDS");
     if (id === "JOURNEY") setActiveModule("JOURNEY");
+    if (id === "GIFT") setActiveModule("GIFT");
     if (onEnterZone) onEnterZone(id);
   };
 
@@ -505,6 +508,9 @@ export function DIYEraLuxPortal({
   }
   if (activeModule === "JOURNEY") {
       return <JourneyStudio onBack={() => setActiveModule(null)} />;
+  }
+  if (activeModule === "GIFT") {
+      return <GiftForgePage onBack={() => setActiveModule(null)} />;
   }
 
   // --- MAIN HUB RENDER ---

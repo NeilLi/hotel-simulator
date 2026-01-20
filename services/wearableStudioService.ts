@@ -47,7 +47,14 @@ const LLM_RESPONSE_SCHEMA = {
   ],
 };
 
-const SYSTEM_INSTRUCTION = `Return STRICT JSON only. No markdown. No extra keys.`;
+const SYSTEM_INSTRUCTION = `Return STRICT JSON only. No markdown. No extra keys.
+When generating design specifications, STRICTLY follow all user constraints:
+- Style (aesthetic): Must match the user-selected style exactly
+- Type (garment): Must match the user-selected garment type exactly
+- Size: Must match the user-selected size exactly
+- Placement: Must respect the specified print placement location
+- Ensure printPrompt generates artwork suitable for the exact placement and garment type
+- Ensure mockupPrompt generates a plain white garment template (NO design, NO print)`;
 
 const ZERO_SHOT_IMAGE_MODEL = "gemini-2.5-flash-image";
 const DESIGN_MODEL = "gemini-3-flash-preview";
@@ -90,26 +97,41 @@ async function uploadDesignToGCS(imageUrl: string, runId: string, suffix: 'print
 }
 
 const buildMockupPrompt = (intent: WearableIntent, draft: WearableDesignDraft) => {
-  const palette = draft.printSpec.palette.join(", ");
-  return `High-end studio product photography of a ${intent.style} ${intent.type} in size ${intent.size}.
-Design concept: ${draft.designConcept}.
-Fabric: ${draft.fabricType}. Print placement: ${draft.printSpec.placement}. Repeat: ${draft.printSpec.repeat}.
-Palette: ${palette}.
+  // Generate a plain white T-shirt template WITHOUT any design/paint
+  // This ensures consistent placement of the print artwork separately
+  return `High-end studio product photography of a plain white ${intent.type} in size ${intent.size}.
+Style: ${intent.style} cut and fit.
+Fabric: ${draft.fabricType} (white/off-white color only).
+CRITICAL: NO design, NO print, NO graphics, NO patterns, NO artwork, NO paint on the garment.
+Show ONLY a clean, plain white garment template.
 Show the ENTIRE garment in-frame with generous margin (do not crop sleeves, collar, or hem).
 Centered flat-lay (or front-facing hanger shot). Premium lighting, realistic fabric folds, accurate shadows.
-White or light grey seamless background. No hands, no models, no props. No text, no watermarks.`;
+White or light grey seamless background. No hands, no models, no props. No text, no watermarks.
+The garment must be completely blank and white - ready for print placement.`;
 };
 
 const buildPrintPrompt = (intent: WearableIntent, draft: WearableDesignDraft) => {
   const palette = draft.printSpec.palette.join(", ");
+  const placement = draft.printSpec.placement || 'FRONT';
+  const repeat = draft.printSpec.repeat || 'single';
+  
   return `Create ONLY the apparel print artwork (no garment, no scene, no product photo).
 Design concept: ${draft.designConcept}.
-Palette: ${palette}.
+Style: ${intent.style}.
+Item type: ${intent.type}.
+Size: ${intent.size}.
+Print placement: ${placement}.
+Repeat pattern: ${repeat}.
+Color palette: ${palette}.
 Requirements:
 - Isolated graphic on a TRANSPARENT background (or pure white if transparency isn't possible)
 - No sky, ocean, rooms, gradients, scenic backdrops, or large rectangular color blocks
 - Centered composition, clean edges, print-ready look (screenprint/DTG)
-- No text, no watermarks.`;
+- Design must match the ${intent.style} aesthetic style
+- Design must be appropriate for ${intent.type} and size ${intent.size}
+- Print placement area: ${placement} (ensure design fits this placement area)
+- No text, no watermarks.
+- The artwork should be ready to be placed on a plain white garment template.`;
 };
 
 export const wearableStudioService = {
@@ -191,6 +213,15 @@ export const wearableStudioService = {
           content: item.content,
         })),
         outputContract: "JSON_ONLY",
+        constraints: {
+          style: validatedIntent.style,
+          type: validatedIntent.type,
+          size: validatedIntent.size,
+          story: validatedIntent.story,
+          requiresPlainWhiteMockup: true,
+          requiresSeparatePrintArtwork: true,
+          instructions: "The mockupPrompt MUST generate a plain white garment template with NO design. The printPrompt MUST generate standalone print artwork suitable for placement on the white template.",
+        },
       },
     };
   },

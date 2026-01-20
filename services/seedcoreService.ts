@@ -209,11 +209,27 @@ class SeedCoreService {
       const response = await fetch(url, options);
       if (!response.ok) {
         const errorText = await response.text();
-        throw new Error(`API error (${response.status}): ${errorText}`);
+        let errorMessage = `API error (${response.status}): ${errorText}`;
+        
+        // Check for database constraint errors (server not initialized)
+        if (errorText.includes('snapshot_id') || errorText.includes('null value') || errorText.includes('violates not-null constraint')) {
+          errorMessage = 'SERVER_NOT_INITIALIZED';
+        }
+        
+        const error = new Error(errorMessage);
+        (error as any).status = response.status;
+        (error as any).originalMessage = errorText;
+        throw error;
       }
       return await response.json();
     } catch (error) {
       if (error instanceof Error) {
+        // Check if it's a network error (server not running)
+        if (error.message.includes('Failed to fetch') || error.message.includes('NetworkError') || error.message.includes('ECONNREFUSED')) {
+          const networkError = new Error('SERVER_NOT_RUNNING');
+          (networkError as any).originalError = error;
+          throw networkError;
+        }
         throw error;
       }
       throw new Error(`Request failed: ${String(error)}`);
