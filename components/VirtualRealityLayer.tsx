@@ -1,362 +1,910 @@
-import React, { useRef, useMemo, useState } from 'react';
-import { Canvas, useFrame } from '@react-three/fiber';
-import { 
-  MeshReflectorMaterial, 
-  Text,
-  PerspectiveCamera,
+import React, { useMemo, useRef, useState, useEffect, Suspense } from "react";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
+import {
   Environment,
   Float,
-  Billboard,
-  Html
-} from '@react-three/drei';
-import * as THREE from 'three';
-import { Room, Agent, AgentRole } from '../types';
+  RoundedBox,
+  Sparkles,
+  Grid,
+  MeshReflectorMaterial,
+  Preload,
+} from "@react-three/drei";
+import { EffectComposer, Bloom, Noise, Vignette } from "@react-three/postprocessing";
+import * as THREE from "three";
+import type { Room, Agent } from "../types";
+import { GRID_WIDTH, GRID_HEIGHT } from "../constants";
+import { DroneAgent } from "./DroneAgent";
 
-// Fix: Consolidated explicit type declarations for React Three Fiber intrinsic elements
-// Removed conflicting 'declare module react' block
+// Fix: Add explicit declaration for JSX Intrinsic Elements to support React Three Fiber components
 declare global {
   namespace JSX {
     interface IntrinsicElements {
-      group: any;
-      mesh: any;
-      planeGeometry: any;
-      meshStandardMaterial: any;
-      sphereGeometry: any;
-      icosahedronGeometry: any;
-      fog: any;
       ambientLight: any;
       pointLight: any;
-      cylinderGeometry: any;
-      ringGeometry: any;
+      spotLight: any;
       hemisphereLight: any;
-      meshBasicMaterial: any; // Added missing type
+      rectAreaLight: any;
+      group: any;
+      mesh: any;
+      primitive: any;
+      fog: any;
+      gridHelper: any;
+      
+      // Geometries
+      boxGeometry: any;
+      sphereGeometry: any;
+      planeGeometry: any;
+      cylinderGeometry: any;
+      torusGeometry: any;
+      ringGeometry: any;
+      circleGeometry: any;
+      octahedronGeometry: any;
+      icosahedronGeometry: any;
+      
+      // Materials
+      meshBasicMaterial: any;
+      meshStandardMaterial: any;
+      meshPhysicalMaterial: any;
+      
+      [elemName: string]: any;
     }
   }
 }
 
-// RESTORED SCALE: 1.0 feels more natural with this close-up camera
-const GRID_SCALE = 1.0; 
-// Center the coordinate system on the Lobby Atrium (approx X=40, Y=34 in grid coords)
-const OFFSET_X = 40; 
-const OFFSET_Y = 34;
+type Quality = "safe" | "medium" | "high";
 
-// --- Sub-Component: Tactical Room Zone ---
-function RoomZone({ room, themeColor }: { room: Room, themeColor: string }) {
-  if (!room || !room.topLeft || !room.bottomRight) return null;
-
-  const width = room.bottomRight.x - room.topLeft.x + 1;
-  const height = room.bottomRight.y - room.topLeft.y + 1;
-
-  // Calculate center relative to our new origin
-  const roomCenterX = room.topLeft.x + width / 2;
-  const roomCenterY = room.topLeft.y + height / 2;
-
-  const x = (roomCenterX - OFFSET_X) * GRID_SCALE;
-  const z = (roomCenterY - OFFSET_Y) * GRID_SCALE;
-
-  return (
-    <group position={[x, 0, z]}>
-      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.01, 0]}>
-        <planeGeometry args={[width * GRID_SCALE, height * GRID_SCALE]} />
-        <meshStandardMaterial 
-            color={themeColor} 
-            transparent 
-            opacity={0.1} 
-            emissive={themeColor} 
-            emissiveIntensity={1} 
-            toneMapped={false} 
-        />
-      </mesh>
-    </group>
-  );
-}
-
-// --- Sub-Component: Animated Robot Marker ---
-function RobotMarker({ agent, themeColor, onAgentClick }: { agent: Agent, themeColor: string, onAgentClick?: (agentId: string) => void }) {
-  const groupRef = useRef<THREE.Group>(null);
-  const coreRef = useRef<THREE.Mesh>(null);
-  const ringRef = useRef<THREE.Mesh>(null);
-  const [hovered, setHovered] = useState(false);
-  
-  // Random offset for animation so they don't all bob in perfect sync
-  const animOffset = useMemo(() => Math.random() * 100, []);
-  
-  const isRobot = agent.role !== AgentRole.GUEST;
-  // Robots get Cyan, Guests get Amber
-  const baseColor = isRobot ? "#22d3ee" : "#fbbf24";
-  // Special color for conversing state
-  const conversingColor = "#a78bfa"; // Purple for conversation
-  const color = agent.state === 'CONVERSING' ? conversingColor : (hovered ? "#ffffff" : baseColor);
-  const label = isRobot ? agent.role.replace('ROBOT_', '') : 'GUEST';
+// -----------------------------
+// 1) REFINED CINEMATIC CAMERA
+// -----------------------------
+function CinematicCamera() {
+  const { camera, pointer } = useThree();
+  const vec = useMemo(() => new THREE.Vector3(), []);
 
   useFrame((state) => {
-    // FIX: Removed 'ringRef.current' from the safety check. 
-    // Guests do not have a ringRef, so the previous code forced an early return, freezing them.
-    if (!groupRef.current || !coreRef.current) return;
-    
-    const t = state.clock.elapsedTime + animOffset;
+    const time = state.clock.getElapsedTime();
+    // Smoother, slower drift for luxury feel
+    const driftX = Math.sin(time * 0.2) * 0.5;
+    const driftY = Math.cos(time * 0.2) * 0.2;
 
-    // Hover Animation (Sine wave) - RESTORED: Lower hover height (0.5 base)
-    groupRef.current.position.y = 0.5 + Math.sin(t * 2) * 0.08;
-    
-    // Core Rotation
-    coreRef.current.rotation.x = t * 0.5;
-    coreRef.current.rotation.y = t * 0.8;
-
-    // Ring Rotation (Opposite direction) - Only if ring exists (Robots)
-    if (ringRef.current) {
-        ringRef.current.rotation.z = -t * 1.5;
-    }
-
-    // Pulse Scale
-    const scale = hovered ? 1.4 : (1 + Math.sin(t * 4) * 0.05);
-    coreRef.current.scale.setScalar(scale);
+    camera.position.lerp(vec.set(pointer.x * 2 + driftX, 3.5 + pointer.y + driftY, 22), 0.03);
+    camera.lookAt(0, 2, 0);
   });
 
-  const x = (agent.position?.x - OFFSET_X) * GRID_SCALE;
-  const z = (agent.position?.y - OFFSET_Y) * GRID_SCALE;
+  return null;
+}
+
+// -----------------------------
+// 2) GRADIENT BACKDROP
+// -----------------------------
+function GradientBackdrop({ isGolden }: { isGolden: boolean }) {
+  const colors = useMemo(() => {
+    return {
+      top: new THREE.Color(isGolden ? "#d97706" : "#0891b2"),
+      mid: new THREE.Color(isGolden ? "#78350f" : "#1e1b4b"),
+      bot: new THREE.Color(isGolden ? "#2a1505" : "#020617"),
+    };
+  }, [isGolden]);
+
+  const material = useMemo(() => {
+    return new THREE.ShaderMaterial({
+      side: THREE.BackSide,
+      uniforms: {
+        uTop: { value: colors.top },
+        uMid: { value: colors.mid },
+        uBot: { value: colors.bot },
+      },
+      vertexShader: `
+        varying vec3 vPos;
+        void main() {
+          vPos = position;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: `
+        varying vec3 vPos;
+        uniform vec3 uTop;
+        uniform vec3 uMid;
+        uniform vec3 uBot;
+
+        void main() {
+          float h = normalize(vPos).y * 0.5 + 0.5;
+          vec3 col = mix(uBot, uMid, smoothstep(0.0, 0.4, h));
+          col = mix(col, uTop, smoothstep(0.4, 1.0, h));
+          float horizon = 1.0 - abs(h - 0.45);
+          col += uTop * pow(horizon, 20.0) * 0.2;
+          gl_FragColor = vec4(col, 1.0);
+        }
+      `,
+    });
+  }, [colors]);
 
   return (
-    <group position={[x, 0, z]}>
-      {/* Invisible Hit Box for easy mouse interaction */}
-      <mesh 
-        visible={false} 
-        position={[0, 1, 0]} 
-        onPointerOver={(e) => { 
-          e.stopPropagation(); 
-          setHovered(true);
-          if (e.intersections && e.intersections.length > 0) {
-            document.body.style.cursor = 'pointer';
-          }
-        }} 
-        onPointerOut={(e) => {
-          e.stopPropagation();
-          setHovered(false);
-          document.body.style.cursor = 'default';
-        }}
-        onPointerMove={(e) => {
-          e.stopPropagation();
-        }}
-        onClick={(e) => {
-          e.stopPropagation();
-          console.log(`[Agent ${agent.id}] Clicked - Role: ${agent.role}, State: ${agent.state}, Mood: ${agent.mood}`);
-          if (onAgentClick) {
-            onAgentClick(agent.id);
-          }
-        }}
-      >
-         <sphereGeometry args={[1.5, 16, 16]} />
-      </mesh>
+    <mesh position={[0, 0, -20]} scale={150}>
+      <sphereGeometry args={[1, 32, 32]} />
+      <primitive object={material} attach="material" />
+    </mesh>
+  );
+}
 
-      {/* Floating Animation Group */}
-      <group ref={groupRef}>
-        
-        {/* The Core Body - RESTORED: Bright, visible materials */}
-        <mesh ref={coreRef}>
-          {isRobot ? (
-            <icosahedronGeometry args={[0.4, 0]} /> 
-          ) : (
-            // REDUCED GUEST SIZE: 0.35 -> 0.25
-            <sphereGeometry args={[0.25, 16, 16]} />
-          )}
-          {/* Using basic material or standard with high emissive ensures color pop */}
-          <meshStandardMaterial 
-            color={color}
-            emissive={agent.state === 'CONVERSING' ? conversingColor : baseColor} 
-            emissiveIntensity={agent.state === 'CONVERSING' ? 6 : 4} 
-            toneMapped={false}
-            roughness={0.2}
-            metalness={0.8}
-          />
-        </mesh>
-        
-        {/* Outer Tech Shell (Robots Only) */}
-        {isRobot && (
-           <mesh scale={[1.4, 1.4, 1.4]}>
-              <icosahedronGeometry args={[0.4, 0]} />
-              <meshBasicMaterial color={baseColor} wireframe transparent opacity={0.3} />
-           </mesh>
-        )}
-        
-        {/* Rotating Data Ring (Robots only) */}
-        {isRobot && (
-          <group rotation={[Math.PI / 2, 0, 0]}>
-             <mesh ref={ringRef}>
-               <ringGeometry args={[0.5, 0.6, 6]} />
-               <meshStandardMaterial color={baseColor} emissive={baseColor} emissiveIntensity={3} toneMapped={false} side={THREE.DoubleSide} transparent opacity={0.6} />
-             </mesh>
+// -----------------------------
+// 3) DYNAMIC DATA WALL
+// -----------------------------
+function DataStreamBackground({ themeColor }: { themeColor: string }) {
+  const ref = useRef<THREE.Group>(null);
+
+  useFrame((state) => {
+    if (ref.current) ref.current.position.y = Math.sin(state.clock.elapsedTime * 0.5) * 1.5;
+  });
+
+  return (
+    <group position={[0, 0, -2]}>
+      <Grid
+        args={[60, 30]}
+        cellSize={2}
+        cellThickness={1.5}
+        cellColor={themeColor}
+        sectionSize={10}
+        sectionThickness={3}
+        sectionColor="#ffffff"
+        rotation={[Math.PI / 2, 0, 0]}
+        position={[0, 0, 0]}
+        fadeDistance={25}
+      />
+
+      <group ref={ref}>
+        {[-25, -15, -5, 5, 15, 25].map((x, i) => (
+          <group key={i} position={[x, 0, 0.5]}>
+            <mesh>
+              <planeGeometry args={[0.5, 8]} />
+              <meshBasicMaterial color={themeColor} transparent opacity={0.18} />
+            </mesh>
+            <mesh position={[2, -2, 0]}>
+              <planeGeometry args={[0.2, 4]} />
+              <meshBasicMaterial color={themeColor} transparent opacity={0.10} />
+            </mesh>
           </group>
-        )}
-
-        {/* Local Light Source */}
-        <pointLight color={agent.state === 'CONVERSING' ? conversingColor : baseColor} intensity={agent.state === 'CONVERSING' ? 3 : 2} distance={3} decay={2} />
-
-        {/* HTML Hotspot Label */}
-        <Html position={[0, 0.8, 0]} center distanceFactor={10} style={{ pointerEvents: 'none' }}>
-           <div className={`
-             flex items-center gap-3 px-3 py-2 rounded-lg backdrop-blur-md border transition-all duration-300 origin-bottom
-             ${hovered ? 'bg-slate-900/90 border-cyan-500/50 scale-110 shadow-[0_0_30px_rgba(34,211,238,0.4)]' : 'bg-slate-900/30 border-white/10 opacity-70'}
-           `}>
-             <div className={`w-2 h-2 rounded-sm ${isRobot ? 'bg-cyan-400' : 'bg-amber-400'} ${hovered ? 'animate-spin' : ''}`} />
-             <div className="flex flex-col text-left">
-                <span className={`text-[10px] font-bold uppercase tracking-widest whitespace-nowrap ${isRobot ? 'text-cyan-100' : 'text-amber-100'}`}>
-                  {label}
-                </span>
-                {hovered && (
-                  <div className="flex flex-col mt-1 space-y-0.5 border-t border-white/10 pt-1">
-                    <span className={`text-[8px] font-mono uppercase ${
-                      agent.state === 'CONVERSING' ? 'text-cyan-400 font-bold' : 'text-white/60'
-                    }`}>
-                      STATUS: {agent.state}
-                      {agent.state === 'CONVERSING' && ' 💬'}
-                      {agent.isGeneratingDialogue && ' ⏳'}
-                    </span>
-                    <span className="text-[8px] font-mono text-white/60 uppercase">MOOD: {agent.mood}</span>
-                    {agent.isGeneratingDialogue && (
-                      <span className="text-[7px] font-mono text-cyan-400/70 italic mt-1 animate-pulse">
-                        Generating dialogue...
-                      </span>
-                    )}
-                    {agent.dialogue && !agent.isGeneratingDialogue && (
-                      <span className="text-[7px] font-mono text-white/50 italic mt-1 pt-1 border-t border-white/5">
-                        "{agent.dialogue.substring(0, 40)}{agent.dialogue.length > 40 ? '...' : ''}"
-                      </span>
-                    )}
-                  </div>
-                )}
-             </div>
-           </div>
-        </Html>
+        ))}
       </group>
+    </group>
+  );
+}
 
-      {/* Ground Connection Beam */}
-      <mesh position={[0, 0.25, 0]}>
-         <cylinderGeometry args={[0.01, 0.01, 0.5, 4]} />
-         <meshStandardMaterial color={baseColor} transparent opacity={0.3} emissive={baseColor} blending={THREE.AdditiveBlending} depthWrite={false} />
-      </mesh>
+// -----------------------------
+// 4) ARCHITECTURAL LIGHTING
+// -----------------------------
+// Helper to init RectAreaLightUniformsLib safely
+function LightingGlobals() {
+  useEffect(() => {
+    // Try standard import path
+    import("three/examples/jsm/lights/RectAreaLightUniformsLib.js")
+      .then((module) => module.RectAreaLightUniformsLib.init())
+      .catch(() => {
+        // Fallback import path
+        import("three/addons/lights/RectAreaLightUniformsLib.js")
+          .then((module) => module.RectAreaLightUniformsLib.init())
+          .catch(e => console.warn("RectAreaLight init failed", e));
+      });
+  }, []);
+  return null;
+}
+
+function ArchitecturalLights({ isGolden }: { isGolden: boolean }) {
+  const lightColor = isGolden ? "#ffdfad" : "#e0f2fe";
+  
+  return (
+    <group>
+      {/* Large Ceiling Softbox - Creates soft, realistic shadows */}
+      <rectAreaLight
+        width={15}
+        height={30}
+        intensity={isGolden ? 5 : 8}
+        color={lightColor}
+        position={[0, 12, 0]}
+        rotation={[-Math.PI / 2, 0, 0]}
+      />
       
-      {/* Floor Ripple Effect */}
-      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.02, 0]}>
-         <ringGeometry args={[0.2, 0.3, 16]} />
-         <meshStandardMaterial 
-            color={baseColor} 
-            transparent 
-            opacity={0.4} 
-            emissive={baseColor} 
-            emissiveIntensity={2} 
-            toneMapped={false}
-         />
+      {/* Accent Rim Lights for Columns */}
+      <pointLight position={[15, 5, 5]} intensity={20} color={lightColor} distance={30} decay={2} />
+      <pointLight position={[-15, 5, 5]} intensity={20} color={lightColor} distance={30} decay={2} />
+    </group>
+  );
+}
+
+// -----------------------------
+// 4b) ARCHITECTURAL LIGHT PANELS (cheap color wash) - kept for compatibility
+// -----------------------------
+function LightPanels({ a, b }: { a: string; b: string }) {
+  return (
+    <group>
+      <mesh position={[0, 10.8, 2]} rotation={[Math.PI / 2, 0, 0]}>
+        <planeGeometry args={[18, 6]} />
+        <meshBasicMaterial color={a} transparent opacity={0.06} toneMapped={false} />
+      </mesh>
+
+      <mesh position={[0, 6, -14.7]}>
+        <planeGeometry args={[40, 12]} />
+        <meshBasicMaterial color={b} transparent opacity={0.05} toneMapped={false} />
       </mesh>
     </group>
   );
 }
 
-export function VirtualRealityLayer({ 
-  atmosphere, 
-  enabled, 
-  rooms, 
-  agents,
-  backgroundImage,
-  onAgentClick
-}: { 
-  atmosphere: string, enabled: boolean, rooms: Room[], agents: Agent[], backgroundImage?: string, onAgentClick?: (agentId: string) => void
+// -----------------------------
+// 5) FLOOR INLAYS (clean single-color style, reflection-safe)
+// -----------------------------
+function FloorInlays({
+  palette,
+  quality,
+}: {
+  palette: { accentA: string };
+  quality: Quality;
 }) {
-  const isGolden = atmosphere === 'GOLDEN_HOUR';
-  const themeColor = isGolden ? "#fbbf24" : "#22d3ee";
-
-  const particles = useMemo(() => [...Array(20)].map(() => ({
-    pos: [(Math.random() - 0.5) * 30, Math.random() * 8, (Math.random() - 0.5) * 20] as [number, number, number],
-  })), []);
+  const y = 0.012;
 
   return (
-    <div 
-      className="absolute inset-0 z-10 transition-opacity duration-1000 pointer-events-auto" 
-      style={{ 
-        visibility: enabled ? 'visible' : 'hidden', 
-        opacity: enabled ? 1 : 0 
-      }}
-    >
-      {/* HTML Background Layer */}
-      <div className="absolute inset-0 z-0 pointer-events-none">
-        {backgroundImage ? (
-          <img 
-            src={backgroundImage} 
-            className="w-full h-full object-cover opacity-90 brightness-110 grayscale-[0.1]" 
-            alt="Atmosphere"
-            onError={(e) => { e.currentTarget.style.display = 'none'; }}
+    <group position={[0, y, 0]}>
+      {/* Single-color concentric rings - architectural etchings, not light sources */}
+      {[12, 20].map((r) => (
+        <mesh key={r} rotation={[Math.PI / 2, 0, 0]}>
+          <ringGeometry args={[r, r + 0.06, 128]} />
+          <meshStandardMaterial
+            color={palette.accentA}
+            emissive={palette.accentA}
+            emissiveIntensity={0.6}
+            roughness={0.35}
+            metalness={0.25}
           />
-        ) : (
-          <div className={`w-full h-full ${isGolden ? 'bg-orange-900/40' : 'bg-slate-900/50'}`} />
-        )}
-        {/* Soft Vignette to focus center */}
-        <div className="absolute inset-0 shadow-[inset_0_0_120px_rgba(0,0,0,0.6)]" />
-      </div>
+        </mesh>
+      ))}
+    </group>
+  );
+}
 
-      {/* WebGL Overlay */}
-      <div className="absolute inset-0 pointer-events-auto">
-        <Canvas
-          gl={{ preserveDrawingBuffer: true, antialias: true, alpha: true }}
-          dpr={[1, 2]}
-          frameloop='always'
-          onCreated={({ gl }) => gl.setClearColor(new THREE.Color('#000000'), 0)}
-          style={{ width: '100%', height: '100%' }}
-        >
-        {/* 
-          RESTORED CAMERA:
-          Position: [0, 5, 16] - Low and close for desk-level immersion.
-          LookAt: [0, 0.5, 0] - Pushes scene down slightly for better composition.
-        */}
-        <PerspectiveCamera 
-          makeDefault 
-          position={[0, 5, 16]} 
-          fov={45} 
-          onUpdate={(c) => c.lookAt(0, 0.5, 0)} 
-        />
-        
-        {/* Lightweight Fog to blend distance */}
-        <fog attach="fog" args={['#000000', 10, 40]} />
+// -----------------------------
+// 6) MEZZANINE RING (top floor feel)
+// -----------------------------
+function Mezzanine({
+  neonA,
+  neonWhiteMat,
+  quality,
+}: {
+  neonA: THREE.Material;
+  neonWhiteMat: THREE.Material;
+  quality: Quality;
+}) {
+  const y = 6.2;
+  const radius = 22;
 
-        <group>
-          {/* Reflective Floor - subtle grid */}
-          <mesh rotation={[-Math.PI / 2, 0, 0]}>
-            <planeGeometry args={[120, 120]} />
-            <MeshReflectorMaterial
-              blur={[300, 100]}
-              resolution={512}
-              mixBlur={1}
-              mixStrength={10}
-              roughness={0.7}
-              color="#050505"
-              metalness={0.5}
-              transparent={true}
-              opacity={0.15}
-            />
+  return (
+    <group position={[0, y, 0]}>
+      <mesh receiveShadow castShadow>
+        <cylinderGeometry args={[radius, radius, 0.6, 96, 1, true]} />
+        <meshStandardMaterial color="#101318" roughness={0.55} metalness={0.15} envMapIntensity={0.9} />
+      </mesh>
+
+      <mesh position={[0, -0.31, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+        <ringGeometry args={[radius - 6.5, radius - 0.4, 96]} />
+        <meshStandardMaterial color="#0b0d14" roughness={0.95} metalness={0.0} />
+      </mesh>
+
+      <mesh position={[0, 0.45, 0]}>
+        <torusGeometry args={[radius - 0.2, 0.06, 12, 180]} />
+        <primitive object={neonA} attach="material" />
+      </mesh>
+
+      {Array.from({ length: 22 }).map((_, i) => {
+        const a = (i / 22) * Math.PI * 2;
+        const px = Math.cos(a) * (radius - 0.3);
+        const pz = Math.sin(a) * (radius - 0.3);
+        return (
+          <mesh key={i} position={[px, 0.05, pz]} castShadow>
+            <cylinderGeometry args={[0.06, 0.06, 0.9, 10]} />
+            <primitive object={neonWhiteMat} attach="material" />
           </mesh>
+        );
+      })}
 
-          {rooms?.map((room) => <RoomZone key={room.id} room={room} themeColor={themeColor} />)}
+      {quality !== "safe" && (
+        <mesh position={[0, -0.35, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+          <ringGeometry args={[radius - 1.0, radius + 1.0, 96]} />
+          <meshBasicMaterial color="#ffffff" transparent opacity={0.04} toneMapped={false} />
+        </mesh>
+      )}
+    </group>
+  );
+}
 
-          {/* Render Agents as Interactive Hotspots */}
-          {agents?.map((agent) => (
-             <RobotMarker key={agent.id} agent={agent} themeColor={themeColor} onAgentClick={onAgentClick} />
-          ))}
+// -----------------------------
+// 7) LOBBY ENVIRONMENT (Luxury Materials)
+//    - Physical materials with clearcoat for luxury feel
+// -----------------------------
+function LobbyEnvironment({
+  themeColor,
+  neonA,
+  neonWhiteMat,
+  neonB,
+  neonC,
+  isGolden,
+  quality,
+}: {
+  themeColor: string;
+  neonA: THREE.Material;
+  neonWhiteMat: THREE.Material;
+  neonB: THREE.Material;
+  neonC: THREE.Material;
+  isGolden: boolean;
+  quality: Quality;
+}) {
+  return (
+    <group>
+      {/* MONOLITH DISPLAY BASE */}
+      <mesh position={[0, 0.05, -2]}>
+        <cylinderGeometry args={[4, 4.2, 0.1, 64]} />
+        <meshStandardMaterial color="#000" metalness={1} roughness={0.2} />
+      </mesh>
 
-          {/* Ambient Floating Dust */}
-          {particles.map((p, i) => (
-            <Float key={i} speed={1} floatIntensity={2} rotationIntensity={1}>
-              <mesh position={p.pos}>
-                <sphereGeometry args={[0.02, 4, 4]} />
-                <meshStandardMaterial emissive={themeColor} emissiveIntensity={5} toneMapped={false} transparent opacity={0.3} />
+      {/* RECEPTION */}
+      <group position={[0, 0, -2]}>
+        {/* Reception Desk - Physical Marble Look */}
+        <RoundedBox args={[12, 1.2, 2.5]} radius={0.05} position={[0, 0.6, -6]}>
+          <meshPhysicalMaterial
+            color={isGolden ? "#1a1612" : "#0f172a"}
+            metalness={0.2}
+            roughness={0.1}
+            clearcoat={1}
+            envMapIntensity={2}
+          />
+        </RoundedBox>
+
+        <RoundedBox args={[10, 1.1, 3]} radius={0.2} smoothness={8} position={[0, 0.55, 0]}>
+          <meshPhysicalMaterial 
+            color={isGolden ? "#1a1612" : "#0f172a"} 
+            roughness={0.1} 
+            metalness={0.2} 
+            clearcoat={1}
+            envMapIntensity={1.2} 
+          />
+        </RoundedBox>
+
+        <mesh position={[0, 0.08, 0]}>
+          <boxGeometry args={[10.4, 0.06, 3.4]} />
+          <primitive object={neonB} attach="material" />
+        </mesh>
+
+        <mesh position={[0, 0.5, 1.51]}>
+          <boxGeometry args={[9.8, 0.05, 0.02]} />
+          <primitive object={neonA} attach="material" />
+        </mesh>
+
+        {/* Glass top (stable) */}
+        <mesh position={[0, 1.15, 0]}>
+          <boxGeometry args={[9.6, 0.08, 2.8]} />
+          <meshPhysicalMaterial
+            color="#ffffff"
+            transparent
+            opacity={0.10}
+            roughness={0.25}
+            metalness={0.0}
+            clearcoat={1}
+            clearcoatRoughness={0.12}
+            envMapIntensity={1.3}
+          />
+        </mesh>
+
+        {[-4.9, 4.9].map((x) => (
+          <mesh key={x} position={[x, 0.65, 0]}>
+            <boxGeometry args={[0.08, 1.0, 2.9]} />
+            <primitive object={neonC} attach="material" />
+          </mesh>
+        ))}
+
+        <Float speed={2} rotationIntensity={0.05} floatIntensity={0.1}>
+          <group position={[0, 1.8, 0.5]}>
+            <mesh>
+              <planeGeometry args={[5, 1.5]} />
+              <meshBasicMaterial color={themeColor} transparent opacity={0.10} side={THREE.DoubleSide} toneMapped={false} />
+            </mesh>
+          </group>
+        </Float>
+      </group>
+
+      {/* COLUMNS - Brushed Bronze/Steel with Physical Materials */}
+      {[-14, 14].map((sideX) => (
+        <group key={sideX}>
+          {[-5, 10].map((zPos) => (
+            <group key={zPos} position={[sideX, 6, zPos]}>
+              <mesh castShadow receiveShadow>
+                <cylinderGeometry args={[2, 2, 12, 28]} />
+                <meshPhysicalMaterial
+                  color={isGolden ? "#2b2319" : "#1e293b"}
+                  metalness={0.8}
+                  roughness={0.3}
+                  clearcoat={0.5}
+                  envMapIntensity={1.0}
+                />
               </mesh>
-            </Float>
+              
+              {/* Subtle Glow Ring */}
+              <mesh position={[0, -5.8, 0]}>
+                <torusGeometry args={[1.6, 0.02, 16, 64]} />
+                <meshBasicMaterial color={themeColor} />
+              </mesh>
+
+              <mesh position={[0, -5.6, 0]} castShadow receiveShadow>
+                <cylinderGeometry args={[2.35, 2.35, 0.6, 24]} />
+                <meshStandardMaterial color="#151a21" roughness={0.5} metalness={0.2} />
+              </mesh>
+
+              <mesh position={[0, 5.6, 0]} castShadow receiveShadow>
+                <cylinderGeometry args={[2.25, 2.25, 0.6, 24]} />
+                <meshStandardMaterial color="#151a21" roughness={0.5} metalness={0.2} />
+              </mesh>
+
+              <mesh position={[0, 2.2, 0]}>
+                <torusGeometry args={[2.05, 0.05, 10, 48]} />
+                <primitive object={sideX > 0 ? neonB : neonC} attach="material" />
+              </mesh>
+              <mesh position={[0, -2.2, 0]}>
+                <torusGeometry args={[2.05, 0.05, 10, 48]} />
+                <primitive object={sideX > 0 ? neonC : neonB} attach="material" />
+              </mesh>
+
+              <mesh position={[sideX > 0 ? -1.9 : 1.9, 0, 0]}>
+                <boxGeometry args={[0.12, 12, 0.25]} />
+                <primitive object={neonA} attach="material" />
+              </mesh>
+
+              <mesh position={[0, 3, 0.001]}>
+                <torusGeometry args={[2.05, 0.05, 12, 56]} />
+                <primitive object={neonWhiteMat} attach="material" />
+              </mesh>
+            </group>
           ))}
         </group>
+      ))}
 
-        <Environment preset="city" />
-        <ambientLight intensity={1.5} />
-        <pointLight position={[10, 10, 10]} intensity={1} />
-        <pointLight position={[-10, 5, -10]} intensity={0.5} color={themeColor} />
+      {/* CEILING */}
+      <group position={[0, 11, 0]}>
+        <mesh rotation={[Math.PI / 2, 0, 0]} receiveShadow>
+          <planeGeometry args={[60, 60]} />
+          <meshStandardMaterial color="#1d2230" roughness={0.85} metalness={0.08} envMapIntensity={0.8} />
+        </mesh>
+
+        {[-6, -2, 2, 6].map((x) => (
+          <group key={x}>
+            {/* Core bright line */}
+            <mesh position={[x, -0.1, 0]} rotation={[Math.PI / 2, 0, 0]}>
+              <planeGeometry args={[0.18, 40]} />
+              <primitive object={neonA} attach="material" />
+            </mesh>
+            {/* Soft halo (cheap bloom effect) */}
+            <mesh position={[x, -0.11, 0]} rotation={[Math.PI / 2, 0, 0]}>
+              <planeGeometry args={[0.45, 40]} />
+              <meshBasicMaterial color={themeColor} transparent opacity={0.05} toneMapped={false} />
+            </mesh>
+          </group>
+        ))}
+      </group>
+
+      {/* BACK WALL */}
+      <group position={[0, 6, -15]}>
+        <DataStreamBackground themeColor={themeColor} />
+        <mesh receiveShadow>
+          <boxGeometry args={[60, 20, 0.5]} />
+          <meshPhysicalMaterial
+            color={isGolden ? "#ffd2b8" : "#cceeff"}
+            transparent
+            opacity={0.13}
+            roughness={0.75}
+            metalness={0.0}
+            clearcoat={0.6}
+            clearcoatRoughness={0.35}
+            envMapIntensity={0.7}
+          />
+        </mesh>
+
+        <mesh position={[0, 0, 0.3]}>
+          <ringGeometry args={[5, 5.1, 128]} />
+          <primitive object={neonA} attach="material" />
+        </mesh>
+        <mesh position={[0, 0, 0.32]}>
+          <ringGeometry args={[7, 7.02, 128]} />
+          <primitive object={neonA} attach="material" />
+        </mesh>
+      </group>
+    </group>
+  );
+}
+
+// -----------------------------
+// 8) SEEDCORE MONOLITH
+// -----------------------------
+function SeedCoreMonolith({ color }: { color: string }) {
+  return (
+    <group position={[0, 5, -2]}>
+      <Float speed={3} rotationIntensity={0.5} floatIntensity={0.2}>
+        <mesh>
+          <octahedronGeometry args={[0.6, 0]} />
+          <meshStandardMaterial color={color} emissive={color} emissiveIntensity={4} toneMapped={false} />
+        </mesh>
+        {/* Keep this tiny sparkle count stable */}
+        <Sparkles count={36} scale={2} size={3} speed={0.35} opacity={0.45} color={color} />
+      </Float>
+      <mesh position={[0, -2, 0]}>
+        <cylinderGeometry args={[0.02, 0.02, 4]} />
+        <meshBasicMaterial color={color} transparent opacity={0.2} />
+      </mesh>
+    </group>
+  );
+}
+
+// -----------------------------
+// 9) POST FX
+// -----------------------------
+function PostFX({ enabled }: { enabled: boolean }) {
+  // Directly render EffectComposer. 
+  // R3F handles context readiness better than arbitrary timeouts.
+  if (!enabled) return null;
+
+  return (
+    <EffectComposer multisampling={0} enableNormalPass={false}>
+      <Bloom luminanceThreshold={1.45} intensity={0.65} radius={0.22} mipmapBlur={false} levels={4} />
+      <Noise opacity={0.035} />
+      <Vignette eskil={false} offset={0.1} darkness={1.0} />
+    </EffectComposer>
+  );
+}
+
+class FxBoundary extends React.Component<{ onError: () => void; children: React.ReactNode }> {
+  componentDidCatch() {
+    const props = (this as any).props as { onError: () => void; children: React.ReactNode };
+    props.onError();
+  }
+  render() {
+    const props = (this as any).props as { onError: () => void; children: React.ReactNode };
+    return props.children;
+  }
+}
+
+// -----------------------------
+// 10) QUALITY MANAGER (stable state machine)
+// -----------------------------
+function useQualityManager(enabled: boolean, lockedSafe: boolean) {
+  const [quality, setQuality] = useState<Quality>("safe");
+  const [fps, setFps] = useState(60);
+
+  const fpsAcc = useRef({ frames: 0, last: performance.now() });
+  const stableUp = useRef(0);
+  const stableDown = useRef(0);
+
+  useEffect(() => {
+    if (!enabled) return;
+    // Start at MEDIUM to avoid "incomplete" look on initial load, unless locked
+    if (lockedSafe) setQuality("safe");
+    else setQuality("medium"); 
+  }, [enabled, lockedSafe]);
+
+  useFrame(() => {
+    if (!enabled) return;
+
+    // Estimate fps ~2x/sec
+    const now = performance.now();
+    fpsAcc.current.frames += 1;
+    const dt = now - fpsAcc.current.last;
+
+    if (dt >= 500) {
+      const currentFps = (fpsAcc.current.frames * 1000) / dt;
+      setFps(currentFps);
+      fpsAcc.current.frames = 0;
+      fpsAcc.current.last = now;
+
+      if (lockedSafe) {
+        setQuality("safe");
+        return;
+      }
+
+      // Upgrade logic (needs stability)
+      if (currentFps >= 55) stableUp.current += 1;
+      else if (currentFps >= 42) stableUp.current += 0.5;
+      else stableUp.current = Math.max(0, stableUp.current - 0.5);
+
+      // Downgrade logic (avoid thrashing)
+      if (currentFps < 28) stableDown.current += 1;
+      else stableDown.current = Math.max(0, stableDown.current - 0.5);
+
+      // Apply transitions
+      setQuality((q) => {
+        if (stableDown.current >= 3) {
+          // ~1.5s below threshold -> drop one level
+          stableDown.current = 0;
+          return q === "high" ? "medium" : "safe";
+        }
+
+        if (q === "safe" && stableUp.current >= 3) return "medium"; // ~1.5s stable
+        if (q === "medium" && stableUp.current >= 6) return "high"; // longer stability
+        return q;
+      });
+    }
+  });
+
+  return { quality, fps };
+}
+
+// -----------------------------
+// MAIN COMPONENT
+// -----------------------------
+export function VirtualRealityLayer({
+  atmosphere,
+  enabled,
+  rooms,
+  agents,
+  backgroundImage,
+  onAgentHover,
+  onAgentDoubleClick,
+}: {
+  atmosphere: string;
+  enabled: boolean;
+  rooms: Room[];
+  agents: Agent[];
+  backgroundImage?: string;
+  onAgentHover?: (id: string | null) => void;
+  onAgentDoubleClick?: (agent: Agent) => void;
+}) {
+  const isGolden = atmosphere === "GOLDEN_HOUR";
+  const themeColor = isGolden ? "#d4af37" : "#60a5fa"; // Metallic Gold or Soft Blue for luxury
+  const safeAgents = useMemo(() => (Array.isArray(agents) ? agents : []), [agents]);
+
+  const [lockedSafe, setLockedSafe] = useState(false);
+  const [postFxDisabled, setPostFxDisabled] = useState(false);
+
+  // Quality + FPS (stable)
+  // NOTE: useFrame inside hook requires Canvas, so we render a small child below to run the hook.
+  // We'll store quality/fps in state via a bridge component.
+
+  const [quality, setQuality] = useState<Quality>("medium");
+  const [fps, setFps] = useState(60);
+
+  const palette = useMemo(() => {
+    const accentA = isGolden ? "#fbbf24" : "#06b6d4";
+    const accentB = isGolden ? "#a855f7" : "#f97316";
+    const accentC = isGolden ? "#22c55e" : "#a78bfa";
+    return { accentA, accentB, accentC };
+  }, [isGolden]);
+
+  const makeNeon = (color: string, emissiveIntensity = 3) =>
+    new THREE.MeshStandardMaterial({
+      color,
+      emissive: color,
+      emissiveIntensity,
+      toneMapped: false,
+    });
+
+  const neonA = useMemo(() => makeNeon(palette.accentA, 3.0), [palette]);
+  const neonB = useMemo(() => makeNeon(palette.accentB, 2.6), [palette]);
+  const neonC = useMemo(() => makeNeon(palette.accentC, 2.4), [palette]);
+
+  const neonWhiteMat = useMemo(
+    () =>
+      new THREE.MeshStandardMaterial({
+        color: "#ffffff",
+        emissive: "#ffffff",
+        emissiveIntensity: 2,
+        toneMapped: false,
+      }),
+    []
+  );
+
+  const dpr = 1;
+
+  // Feature gating
+  const allowReflector = !lockedSafe && quality === "high" && fps > 55;
+  const allowPostFX = !lockedSafe && quality === "high" && !postFxDisabled;
+
+  if (!enabled) return null;
+
+  return (
+    <div className="absolute inset-0 z-10 transition-opacity duration-1000 animate-in fade-in" style={{ opacity: 1 }}>
+      <Canvas
+        shadows
+        dpr={dpr}
+        camera={{ fov: 45, position: [0, 4, 22], near: 0.1, far: 200 }}
+        gl={{ antialias: true, alpha: false, depth: true, stencil: false, powerPreference: "high-performance" }}
+        onCreated={({ gl }) => {
+          gl.outputColorSpace = THREE.SRGBColorSpace;
+          gl.toneMapping = THREE.ACESFilmicToneMapping;
+          gl.toneMappingExposure = 1.2; // Slightly reduced for luxury feel
+
+          gl.shadowMap.enabled = true;
+          gl.shadowMap.type = THREE.PCFSoftShadowMap;
+
+          const canvas = gl.domElement;
+
+          const onLost = (e: Event) => {
+            e.preventDefault();
+            setLockedSafe(true);     // only lock on real context loss
+            setPostFxDisabled(true); // and disable postfx too
+            setQuality("safe");
+          };
+
+          canvas.addEventListener("webglcontextlost", onLost, false);
+          const origDispose = gl.dispose.bind(gl);
+          gl.dispose = () => {
+            canvas.removeEventListener("webglcontextlost", onLost, false);
+            origDispose();
+          };
+        }}
+      >
+        <LightingGlobals />
+        <Preload all />
+
+        {/* Bridge: run quality hook inside Canvas and push to outer state */}
+        <QualityBridge enabled={enabled} lockedSafe={lockedSafe} onUpdate={(q, f) => { setQuality(q); setFps(f); }} />
+
+        <CinematicCamera />
+        <GradientBackdrop isGolden={isGolden} />
+        {/* Linear fog for luxury feel - matches background color */}
+        <fog attach="fog" args={[isGolden ? "#0a0806" : "#020408", 15, 45]} />
+
+        <Suspense fallback={null}>
+          <Environment preset={isGolden ? "sunset" : "city"} blur={0.25} background={false} />
+        </Suspense>
+
+        {/* Architectural Lighting - Luxury soft area lights */}
+        <ambientLight intensity={0.2} />
+        <ArchitecturalLights isGolden={isGolden} />
+        
+        {/* Additional fill lights for depth */}
+        <hemisphereLight args={[isGolden ? "#ffdfad" : "#e0f2fe", "#1e1b4b", 0.5]} />
+        <pointLight position={[0, 10, 0]} intensity={2.2} distance={80} decay={1} color="#ffffff" />
+        <spotLight
+          position={[20, 30, 20]}
+          angle={0.38}
+          penumbra={0.25}
+          intensity={quality === "high" ? 60 : quality === "medium" ? 50 : 40}
+          distance={160}
+          decay={2}
+          color={isGolden ? "#fff7ed" : "#e0f2fe"}
+          castShadow
+          shadow-mapSize={[quality === "high" ? 1024 : 512, quality === "high" ? 1024 : 512]}
+          shadow-bias={-0.00002}
+          shadow-normalBias={0.02}
+        />
+
+        <spotLight position={[-15, 10, -5]} intensity={quality === "safe" ? 22 : 34} distance={100} decay={2} color={themeColor} />
+        <pointLight position={[26, 4, 0]} intensity={1.3} distance={120} color={palette.accentC} />
+        <pointLight position={[-26, 4, 0]} intensity={1.1} distance={120} color={palette.accentB} />
+        {/* Front fill to avoid black crush */}
+        <pointLight position={[0, 5, 18]} intensity={1.2} distance={80} decay={2} color="#ffffff" />
+
+        <group>
+          {/* LUXURY FLOOR - Deep charcoal with polished obsidian reflection */}
+          <mesh rotation={[-Math.PI / 2, 0, 0]} receiveShadow>
+            <planeGeometry args={[100, 100]} />
+            {allowReflector ? (
+              <MeshReflectorMaterial
+                blur={[400, 100]} // High blur for soft, expensive reflections
+                resolution={1024}
+                mixBlur={1}
+                mixStrength={15}
+                roughness={1}
+                depthScale={1.2}
+                minDepthThreshold={0.4}
+                maxDepthThreshold={1.4}
+                color={isGolden ? "#0a0908" : "#05070a"} // Deep charcoal/black base
+                metalness={0.5}
+                mirror={0.5} // Partial mirror
+              />
+            ) : (
+              // Medium/safe: polished physical floor (stable, brighter)
+              <meshPhysicalMaterial
+                color={isGolden ? "#0a0908" : "#05070a"}
+                roughness={quality === "medium" ? 0.1 : 0.2}
+                metalness={0.2}
+                clearcoat={1}
+                clearcoatRoughness={quality === "medium" ? 0.1 : 0.2}
+                envMapIntensity={1.15}
+              />
+            )}
+          </mesh>
+
+          {/* Clean Grid: subtle floor etching - very low opacity */}
+          <Grid
+            args={[80, 80]}
+            cellSize={4}
+            cellThickness={0.5}
+            cellColor={isGolden ? "#443b2a" : "#1e293b"}
+            sectionSize={20}
+            sectionThickness={1}
+            sectionColor={isGolden ? "#5c4d32" : "#334155"}
+            fadeDistance={30}
+            position={[0, 0.01, 0]}
+            infiniteGrid
+            material-transparent
+            material-opacity={0.15}
+            material-depthWrite={false}
+            material-toneMapped={false}
+          />
+
+          <FloorInlays palette={palette} quality={quality} />
+          <LightPanels a={palette.accentA} b={palette.accentB} />
+          <Mezzanine neonA={neonA} neonWhiteMat={neonWhiteMat} quality={quality} />
+
+          <LobbyEnvironment
+            themeColor={themeColor}
+            neonA={neonA}
+            neonWhiteMat={neonWhiteMat}
+            neonB={neonB}
+            neonC={neonC}
+            isGolden={isGolden}
+            quality={quality}
+          />
+
+          <SeedCoreMonolith color={themeColor} />
+
+          {safeAgents.map((agent) => (
+            <DroneAgent
+              key={agent.id}
+              agent={agent}
+              themeColor={themeColor}
+              onHover={onAgentHover}
+              onDoubleClick={onAgentDoubleClick}
+            />
+          ))}
+
+          {/* Sparkles: keep buffers stable (no count changes, reflection-safe) */}
+          <Sparkles
+            count={120}
+            scale={30}
+            size={quality === "high" ? 2 : 1.6}
+            speed={0.2}
+            opacity={quality === "high" ? 0.32 : 0.22}
+            color="#fff"
+            position={[0, 5, 0]}
+          />
+        </group>
+
+        {/* POST PROCESSING (optional, never locks safe) */}
+        <FxBoundary
+          onError={() => {
+            // disable postFX only (don’t lock safe)
+            setPostFxDisabled(true);
+            // also drop quality one step to reduce stress
+            setQuality((q) => (q === "high" ? "medium" : q));
+          }}
+        >
+          <Suspense fallback={null}>{allowPostFX ? <PostFX enabled /> : null}</Suspense>
+        </FxBoundary>
       </Canvas>
+
+      <div
+        className="pointer-events-none absolute bottom-2 left-2 rounded bg-black/40 px-2 py-1 text-xs text-white"
+        style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" }}
+      >
+        quality: {lockedSafe ? "safe (locked)" : quality}
+        {" | "}
+        postfx: {postFxDisabled ? "off" : allowPostFX ? "on" : "gated"}
+        {" | "}
+        fps≈{Math.round(fps)}
       </div>
     </div>
   );
+}
+
+// Runs inside Canvas (so it can use useFrame) and reports quality+fps outward.
+function QualityBridge({
+  enabled,
+  lockedSafe,
+  onUpdate,
+}: {
+  enabled: boolean;
+  lockedSafe: boolean;
+  onUpdate: (q: Quality, fps: number) => void;
+}) {
+  const { quality, fps } = useQualityManager(enabled, lockedSafe);
+
+  useEffect(() => {
+    onUpdate(quality, fps);
+  }, [quality, fps, onUpdate]);
+
+  return null;
 }

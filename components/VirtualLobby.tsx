@@ -1,22 +1,22 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { geminiService, LobbyTurnResult } from '../services/geminiService';
-import { RefreshCw, Map, Power, Cpu, Aperture } from 'lucide-react';
-import { SeedCoreState, Room, Agent } from '../types';
+import { RefreshCw, Map, Power, Cpu, Aperture, MessageSquare, Zap, Hammer } from 'lucide-react';
+import { SeedCoreState, Room, Agent, AgentRole } from '../types';
 import { VirtualRealityLayer } from './VirtualRealityLayer';
+import { AgentChatInterface } from './AgentChatInterface';
 
 interface VirtualLobbyProps {
-  onExitLobby: () => void;
+  onNavigate: (view: 'MAP' | 'DIY') => void;
   coreState: SeedCoreState;
   updateCoreState: (updates: Partial<SeedCoreState>) => void;
   isAiEnabled: boolean;
   setIsAiEnabled: (val: boolean) => void;
   rooms: Room[];
   agents: Agent[];
-  onAgentClick?: (agentId: string) => void;
+  onAgentHover?: (id: string | null) => void;
 }
 
-// STRATEGY: Use a High-Res External URL for the default lobby background.
-// Using the raw GitHub content URL to ensure the image loads correctly as an image resource.
+// STRATEGY: Use a High-Res External URL for the default lobby background (static fallback).
 const USER_LOBBY_IMAGE = "https://raw.githubusercontent.com/NeilLi/seedcore-hotel-simulator/main/public/images/lobby.png";
 
 // SAFETY: Helper to sanitize image sources.
@@ -37,15 +37,83 @@ const extractNarrative = (res: LobbyTurnResult | any): string => {
   return "Processing environmental data...";
 };
 
+// --- INTERACTION HUD COMPONENT ---
+const AgentInteractionHUD = ({ agentId, agents }: { agentId: string | null, agents: Agent[] }) => {
+  const [task, setTask] = useState("");
+  
+  const agent = useMemo(() => agents.find(a => a.id === agentId), [agentId, agents]);
+
+  // Generate a mock "thought" or task when the agent changes
+  useEffect(() => {
+    if (!agent) return;
+    
+    const thoughts = {
+       [AgentRole.ROBOT_WAITER]: [
+         "Calibrating espresso blend #402", 
+         "Analyzing guest hydration levels", 
+         "Synchronizing with kitchen grid",
+         "Polishing glassware protocol",
+         "Awaiting service vector"
+       ],
+       [AgentRole.ROBOT_CONCIERGE]: [
+         "Reviewing VIP arrivals", 
+         "Optimizing lobby throughput", 
+         "Updating local weather data",
+         "Accessing city guide database"
+       ],
+       [AgentRole.GUEST]: [
+         "Admiring the architecture", 
+         "Checking flight status", 
+         "Looking for the lounge",
+         "Resting after travel"
+       ]
+    };
+
+    const roleThoughts = thoughts[agent.role as AgentRole] || ["Processing..."];
+    setTask(roleThoughts[Math.floor(Math.random() * roleThoughts.length)]);
+  }, [agent]);
+
+  if (!agentId || !agent) return null;
+
+  return (
+    <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-none z-[60] flex flex-col items-center animate-in fade-in zoom-in-90 duration-300">
+       {/* Connecting Line (Visual) */}
+       <div className="w-px h-16 bg-gradient-to-t from-cyan-500/0 via-cyan-500/50 to-cyan-500 mb-2" />
+       
+       <div className="bg-slate-950/80 backdrop-blur-md border border-cyan-500/30 p-4 rounded-xl shadow-[0_0_30px_rgba(34,211,238,0.2)] max-w-xs text-center">
+          <div className="flex items-center justify-center gap-2 mb-2 text-cyan-400">
+             {agent.role.includes('ROBOT') ? <Zap size={14} className="animate-pulse" /> : <MessageSquare size={14} />}
+             <span className="text-[10px] font-bold uppercase tracking-[0.2em]">Neural Link Established</span>
+          </div>
+          
+          <h3 className="text-white font-mono text-sm mb-1">{agent.role.replace('_', ' ')} <span className="text-slate-500 text-[10px]">{agent.id}</span></h3>
+          <div className="h-px w-full bg-white/10 my-2" />
+          <p className="text-[11px] text-cyan-100 font-mono leading-relaxed">
+             "{task}..."
+          </p>
+          <div className="mt-2 text-[8px] text-cyan-500/60 font-bold uppercase tracking-widest animate-pulse">
+            Double Click to Chat
+          </div>
+          
+          <div className="mt-3 flex justify-center gap-1">
+             <div className="w-1 h-1 bg-cyan-500 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+             <div className="w-1 h-1 bg-cyan-500 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+             <div className="w-1 h-1 bg-cyan-500 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+          </div>
+       </div>
+    </div>
+  );
+}
+
 export const VirtualLobby: React.FC<VirtualLobbyProps> = ({ 
-  onExitLobby, 
+  onNavigate, 
   coreState, 
   updateCoreState,
   isAiEnabled,
   setIsAiEnabled,
   rooms,
   agents,
-  onAgentClick
+  onAgentHover
 }) => {
   const [history, setHistory] = useState<{ role: string, parts: { text: string }[] }[]>([]);
   const [choices, setChoices] = useState<string[]>([]);
@@ -53,6 +121,9 @@ export const VirtualLobby: React.FC<VirtualLobbyProps> = ({
   
   const [lobbyImage, setLobbyImage] = useState<string | null>(USER_LOBBY_IMAGE);
   const [isVisualLoading, setIsVisualLoading] = useState(false);
+  const [hoveredAgent, setHoveredAgent] = useState<string | null>(null);
+
+  const [chattingAgent, setChattingAgent] = useState<Agent | null>(null);
 
   // FIX: Added history.length dependency to prevent infinite loops or missed inits
   useEffect(() => {
@@ -84,13 +155,12 @@ export const VirtualLobby: React.FC<VirtualLobbyProps> = ({
 
       setChoices(result.choices);
       
-      // FIX: Store the raw extracted text in history, not the JSON blob, to make rendering easier
       const narrativeText = extractNarrative(result);
       
       setHistory(prev => [
         ...prev, 
         { role: 'user', parts: [{ text: userAction }] },
-        { role: 'model', parts: [{ text: narrativeText }] } // Store simple text
+        { role: 'model', parts: [{ text: narrativeText }] }
       ]);
 
     } catch (e) {
@@ -102,59 +172,66 @@ export const VirtualLobby: React.FC<VirtualLobbyProps> = ({
 
   const currentNarrative = history.length > 0 ? history[history.length - 1].parts[0].text : "";
 
+  // Handle local hover state + bubble up to parent
+  const handleAgentHover = (id: string | null) => {
+      setHoveredAgent(id);
+      if (onAgentHover) onAgentHover(id);
+  };
+
   return (
     <div className="w-full h-full relative bg-black font-sans overflow-hidden select-none cursor-default">
       
-      {/* --- LAYER 1: STATIC BACKGROUND (Visible only when AI OFF) --- */}
-      <div className={`absolute inset-0 z-0 bg-neutral-950 transition-opacity duration-1000 ${isAiEnabled ? 'opacity-0' : 'opacity-100'}`}>
-           <div className="relative w-full h-full">
-              {/* USAGE: safeImageSrc applied here */}
-              <img 
-                 src={safeImageSrc(lobbyImage || USER_LOBBY_IMAGE)} 
-                 alt="Lobby Visualization" 
-                 // UPDATED: Brightness increased from 0.85 to 1.05
-                 className={`w-full h-full object-cover transition-all duration-[2000ms] ${isVisualLoading ? 'scale-105 blur-md brightness-50' : 'scale-100 blur-0 brightness-105'}`}
-                 onError={(e) => {
-                   console.warn("Background image failed load:", lobbyImage);
-                   // Fallback to a solid color if even the external URL fails (e.g. strict firewall)
-                   e.currentTarget.style.display = 'none';
-                 }}
-              />
-              {/* UPDATED: Reduced gradient opacity from 70/90 to 30/60 */}
-              <div className="absolute inset-0 bg-gradient-to-b from-black/30 via-transparent to-black/60 pointer-events-none" />
-              {/* Changed from cyan-900/10 to amber-500/10 for a warmer, inviting tone */}
-              <div className="absolute inset-0 bg-amber-500/10 mix-blend-overlay pointer-events-none" />
-           </div>
-      </div>
-
-      {/* --- LAYER 1.5: VIRTUAL REALITY DIGITAL TWIN (Visible when AI ON) --- */}
+      {/* --- LAYER 1: 3D VIRTUAL REALITY LAYER (Primary Visual) --- */}
       <VirtualRealityLayer 
         atmosphere={coreState.activeAtmosphere} 
         enabled={isAiEnabled} 
         rooms={rooms} 
         agents={agents} 
-        // USAGE: safeImageSrc applied here
         backgroundImage={safeImageSrc(lobbyImage || USER_LOBBY_IMAGE)}
-        onAgentClick={onAgentClick}
+        onAgentHover={handleAgentHover}
+        onAgentDoubleClick={(agent) => setChattingAgent(agent)}
       />
 
-      {/* --- LAYER 2: HUD --- */}
+      {/* --- LAYER 1.5: INTERACTION HUD --- */}
+      <AgentInteractionHUD agentId={hoveredAgent} agents={agents} />
+      
+      {/* --- LAYER 1.7: AGENT CHAT INTERFACE --- */}
+      {chattingAgent && (
+        <AgentChatInterface agent={chattingAgent} onClose={() => setChattingAgent(null)} />
+      )}
+
+      {/* --- LAYER 0: STATIC FALLBACK (Visible only when AI OFF) --- */}
+      <div className={`absolute inset-0 z-0 bg-neutral-950 transition-opacity duration-1000 ${isAiEnabled ? 'opacity-0 delay-500' : 'opacity-100'}`}>
+           <div className="relative w-full h-full">
+              <img 
+                 src={safeImageSrc(lobbyImage || USER_LOBBY_IMAGE)} 
+                 alt="Lobby Visualization" 
+                 className={`w-full h-full object-cover transition-all duration-[2000ms] ${isVisualLoading ? 'scale-105 blur-md brightness-50' : 'scale-100 blur-0 brightness-110'}`}
+                 onError={(e) => { e.currentTarget.style.display = 'none'; }}
+              />
+              {/* Reduced Overlay Opacity to make image clearer */}
+              <div className="absolute inset-0 bg-gradient-to-b from-black/10 via-transparent to-black/40 pointer-events-none" />
+              <div className="absolute inset-0 bg-amber-500/5 mix-blend-overlay pointer-events-none" />
+           </div>
+      </div>
+
+      {/* --- LAYER 2: HUD & UI --- */}
       {!isAiEnabled ? (
-         // UPDATED: Reduced backdrop opacity from 40 to 20
-         <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/20 backdrop-blur-[2px]">
+         // CHANGED: Removed backdrop-blur-sm and reduced bg-black opacity to allow crystal clear view
+         <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/10">
             <div className="relative z-10 flex flex-col items-center max-w-lg text-center px-6 animate-in fade-in zoom-in duration-1000">
-               <div className="w-24 h-24 rounded-full bg-stone-900/90 border border-white/10 flex items-center justify-center mb-8 shadow-[0_0_60px_rgba(0,0,0,0.8)]">
+               <div className="w-24 h-24 rounded-full bg-stone-900/90 border border-white/10 flex items-center justify-center mb-8 shadow-[0_0_60px_rgba(0,0,0,0.8)] backdrop-blur-md">
                   <Cpu size={36} className="text-cyan-500/50" />
                </div>
                <h2 className="text-2xl font-bold tracking-[0.5em] uppercase text-white mb-3 drop-shadow-2xl">SeedCore</h2>
                <div className="h-px w-32 bg-gradient-to-r from-transparent via-cyan-500/50 to-transparent mb-6" />
-               <p className="text-[10px] text-stone-300 font-mono tracking-[0.2em] leading-relaxed mb-10 uppercase opacity-70">
+               <p className="text-[10px] text-stone-100 font-mono tracking-[0.2em] leading-relaxed mb-10 uppercase opacity-90 drop-shadow-md">
                   System State: Decoupled <br/>
-                  <span className="text-stone-500">Autonomous synthesis on standby</span>
+                  <span className="text-stone-300">Autonomous synthesis on standby</span>
                </p>
                <button 
                  onClick={() => setIsAiEnabled(true)}
-                 className="group relative flex items-center gap-4 px-12 py-4 bg-white text-black rounded-full font-bold uppercase text-[10px] tracking-[0.3em] hover:bg-cyan-400 transition-all active:scale-95 shadow-[0_0_40px_rgba(255,255,255,0.1)] hover:shadow-cyan-500/30"
+                 className="group relative flex items-center gap-4 px-12 py-4 bg-white/90 backdrop-blur-sm text-black rounded-full font-bold uppercase text-[10px] tracking-[0.3em] hover:bg-cyan-400 transition-all active:scale-95 shadow-[0_0_40px_rgba(0,0,0,0.3)] hover:shadow-cyan-500/30"
                >
                   <Power size={14} className="group-hover:animate-pulse" />
                   Initialize Intelligence
@@ -195,10 +272,9 @@ export const VirtualLobby: React.FC<VirtualLobbyProps> = ({
 
            {/* Narrative Subtitles */}
            {history.length > 0 && !isLoading && (
-              <div className="absolute bottom-36 left-1/2 -translate-x-1/2 max-w-2xl w-full text-center px-10 pointer-events-none">
+              <div className="absolute bottom-36 left-1/2 -translate-x-1/2 max-w-2xl w-full text-center px-10">
                  <div className="animate-in fade-in slide-in-from-bottom-4 duration-1000">
-                    <span className="text-[13px] italic font-body text-stone-200 leading-relaxed tracking-wide drop-shadow-[0_4px_15px_rgba(0,0,0,0.9)]">
-                       {/* SAFE: Direct text access, no JSON parsing here */}
+                    <span className="text-[13px] italic font-body text-stone-200 leading-relaxed tracking-wide drop-shadow-[0_4px_15px_rgba(0,0,0,0.9)] bg-black/30 backdrop-blur-sm px-6 py-4 rounded-xl border border-white/5">
                        {currentNarrative}
                     </span>
                  </div>
@@ -224,17 +300,18 @@ export const VirtualLobby: React.FC<VirtualLobbyProps> = ({
 
                  {choices.length > 0 && <div className="w-px h-8 bg-white/10 mx-2" />}
 
+                 {/* DIY Era Button */}
                  <button 
-                   onClick={generateVisuals} 
-                   disabled={isVisualLoading}
-                   className="p-3.5 rounded-xl hover:bg-white/10 text-stone-400 hover:text-cyan-400 transition-colors disabled:opacity-30"
-                   title="Regenerate Reality"
+                   onClick={() => onNavigate('DIY')}
+                   className="px-7 py-3.5 bg-slate-800 text-cyan-400 border border-cyan-500/20 rounded-xl hover:bg-cyan-500/10 transition-all text-[10px] font-bold uppercase tracking-[0.2em] shadow-lg active:scale-95 flex items-center gap-3"
                  >
-                   <RefreshCw size={18} className={isVisualLoading ? "animate-spin" : ""} />
+                    <Hammer size={14} />
+                    Explore DIY Era
                  </button>
 
+                 {/* Director Map Button */}
                  <button 
-                   onClick={onExitLobby}
+                   onClick={() => onNavigate('MAP')}
                    className="px-7 py-3.5 bg-white text-black rounded-xl hover:bg-cyan-50 transition-all text-[10px] font-bold uppercase tracking-[0.2em] shadow-xl active:scale-95 flex items-center gap-3"
                  >
                     <Map size={14} />

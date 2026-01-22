@@ -1,14 +1,13 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Aperture, Map, Film, X, Activity, Clock, Power, Cpu, AlertTriangle, Layers, Terminal, Loader2 } from 'lucide-react';
+import { Aperture, Map, Film, X, Activity, Clock, Power, Cpu, AlertTriangle, Layers, Terminal, Loader2, Thermometer, Wind, Lightbulb, Droplets, Sparkles, RefreshCw } from 'lucide-react';
 import { geminiService } from './services/geminiService';
-import { generateMap, generateAgents, updateAgentsLogic, updateAgentsDialogue, generateDialogueForAgent, setConversingAgent } from './utils/simulationUtils';
+import { generateMap, generateAgents, updateAgentsLogic } from './utils/simulationUtils';
 import { EntityType, Room, Agent, SeedCoreState, SeedCorePlane } from './types';
 import { GRID_WIDTH, GRID_HEIGHT, TICK_RATE_MS } from './constants';
-import { SvgHotelBackdrop } from './components/SvgHotelBackdrop';
+import { DirectorMapLayer } from './components/DirectorMapLayer'; // Updated Import
 import { VirtualLobby } from './components/VirtualLobby';
 import { ConciergePanel } from './components/ConciergePanel';
-import { useEventTracking } from './hooks/useEventTracking';
-import { kafkaPublisher } from './services/kafkaPublisher';
+import { DIYEraLuxPortal } from './components/DIYEraLayer';
 
 // --- SIDEBAR COMPONENT: SENSORY TELEMETRY (LEFT) ---
 const SensoryTelemetryPanel = ({ active }: { active: boolean }) => {
@@ -61,29 +60,31 @@ const SensoryTelemetryPanel = ({ active }: { active: boolean }) => {
 // --- MAIN APP COMPONENT ---
 const App: React.FC = () => {
   const [isInitialized, setIsInitialized] = useState(false);
-  const [inLobby, setInLobby] = useState(true);
+  const [activeView, setActiveView] = useState<'LOBBY' | 'MAP' | 'DIY'>('LOBBY');
   const [isAiEnabled, setIsAiEnabled] = useState(false);
   
   const [grid, setGrid] = useState<EntityType[][]>([]);
   const [rooms, setRooms] = useState<Room[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
+  
+  // Interaction State
   const [selectedRoom, setSelectedRoom] = useState<Room | null>(null);
-  const [videoUrl, setVideoUrl] = useState<string | null>(null);
-  const [isVideoLoading, setIsVideoLoading] = useState(false);
+  const [interactingAgentId, setInteractingAgentId] = useState<string | null>(null);
+
+  // Environment State
+  const [isAdapting, setIsAdapting] = useState(false);
+  const [envMetrics, setEnvMetrics] = useState({
+     temperature: 22.4,
+     humidity: 45,
+     aqi: 12,
+     narrative: ""
+  });
   
   const [coreState, setCoreState] = useState<SeedCoreState>({
     activeAtmosphere: 'MORNING_LIGHT',
     logs: [],
     timeOfDay: 8.0 
   });
-
-  // Initialize event tracking (connects eventEmitter to kafkaPublisher)
-  useEventTracking();
-
-  // Update kafkaPublisher AI state when it changes
-  useEffect(() => {
-    kafkaPublisher.setAiEnabled(isAiEnabled);
-  }, [isAiEnabled]);
 
   useEffect(() => {
     const { grid: g, rooms: r } = generateMap(GRID_WIDTH, GRID_HEIGHT);
@@ -96,9 +97,11 @@ const App: React.FC = () => {
   const tick = useCallback(async () => {
     // Fix: Defensive check to prevent accessing property of undefined
     if (!grid || !Array.isArray(grid) || !grid.length) return;
-    setAgents(prev => updateAgentsLogic(prev || [], grid, coreState));
+    
+    // Pass interactingAgentId to freeze logic
+    setAgents(prev => updateAgentsLogic(prev || [], grid, interactingAgentId));
     setCoreState(prev => ({ ...prev, timeOfDay: (prev.timeOfDay + 0.05) % 24 }));
-  }, [grid, coreState]);
+  }, [grid, interactingAgentId]);
 
   useEffect(() => {
     if (!isInitialized) return;
@@ -106,131 +109,84 @@ const App: React.FC = () => {
     return () => clearInterval(interval);
   }, [isInitialized, tick]);
 
-  // Separate effect for dialogue generation (runs less frequently to avoid API spam)
-  useEffect(() => {
-    if (!isInitialized || !isAiEnabled) return;
+  const handleAdaptiveEnvironment = async () => {
+    if (!isAiEnabled || !selectedRoom) return;
+    setIsAdapting(true);
     
-    const dialogueInterval = setInterval(async () => {
-      await updateAgentsDialogue(agents, coreState, (agentId, dialogue, audioUrl) => {
-        setAgents(prev => prev.map(agent => 
-          agent.id === agentId 
-            ? { ...agent, dialogue, audioUrl, lastDialogueTime: Date.now() }
-            : agent
-        ));
-      });
-    }, 20000); // Check for dialogue generation every 20 seconds
+    try {
+        const result = await geminiService.adaptEnvironment(
+            selectedRoom.name, 
+            coreState.activeAtmosphere, 
+            coreState.timeOfDay
+        );
 
-    return () => clearInterval(dialogueInterval);
-  }, [isInitialized, isAiEnabled, agents, coreState]);
-
-  const requestShot = async (desc: string) => {
-    if (!isAiEnabled) return;
-    setIsVideoLoading(true);
-    const result = await geminiService.generateCinematicShot(desc, coreState.activeAtmosphere);
-    if (result.url) {
-      setVideoUrl(result.url);
-    } else if (result.message) {
-      // Show error/limit message to user
-      alert(result.message);
+        setCoreState(prev => ({ ...prev, activeAtmosphere: result.atmosphere }));
+        setEnvMetrics({
+            temperature: result.temperature,
+            humidity: result.humidity,
+            aqi: result.aqi,
+            narrative: result.narrative
+        });
+    } catch (e) {
+        console.error("Adaptation Error", e);
+    } finally {
+        setIsAdapting(false);
     }
-    setIsVideoLoading(false);
   };
+
+  const getLightingStatus = (atmosphere: string) => {
+    switch (atmosphere) {
+        case 'MORNING_LIGHT': return { text: "Natural 85%", color: "text-amber-200" };
+        case 'GOLDEN_HOUR': return { text: "Warm 60%", color: "text-orange-300" };
+        case 'EVENING_CHIC': return { text: "Dimmed 40%", color: "text-indigo-300" };
+        case 'MIDNIGHT_LOUNGE': return { text: "Deep 20%", color: "text-violet-400" };
+        default: return { text: "Standard", color: "text-cyan-200" };
+    }
+  };
+
+  const lighting = getLightingStatus(coreState.activeAtmosphere);
 
   return (
     <div className="relative w-screen h-screen bg-[#020617] overflow-hidden text-slate-200 font-system selection:bg-cyan-500/20">
       
       {/* VIRTUAL LOBBY (MAIN SCREEN) */}
-      {inLobby ? (
+      {activeView === 'LOBBY' && (
         <div className="absolute inset-0 z-50 animate-in fade-in duration-700">
            <VirtualLobby 
-            onExitLobby={() => setInLobby(false)}
+            onNavigate={(view) => setActiveView(view)}
             coreState={coreState}
             updateCoreState={(updates) => setCoreState(prev => ({ ...prev, ...updates }))}
             isAiEnabled={isAiEnabled}
             setIsAiEnabled={setIsAiEnabled}
             rooms={rooms}
             agents={agents}
-            onAgentClick={async (agentId) => {
-              setAgents(prev => {
-                const clickedAgent = prev.find(a => a.id === agentId);
-                if (!clickedAgent) return prev;
-                
-                // Only allow waiters and guests to enter conversation
-                const canConversate = clickedAgent.role === 'ROBOT_WAITER' || clickedAgent.role === 'GUEST';
-                if (!canConversate) return prev;
-                
-                // Get previous conversing agent and exit it
-                const previousConversingAgentId = setConversingAgent(agentId);
-                
-                // Update agents: exit previous conversing agent, enter new one
-                const updatedAgents = prev.map(agent => {
-                  // Exit previous conversing agent
-                  if (previousConversingAgentId && agent.id === previousConversingAgentId) {
-                    return { 
-                      ...agent, 
-                      state: 'PAUSING' as const,
-                      isGeneratingDialogue: false
-                    };
-                  }
-                  // Enter conversation for clicked agent
-                  if (agent.id === agentId) {
-                    return { 
-                      ...agent, 
-                      state: 'CONVERSING' as const, 
-                      target: { ...agent.position }, // Stop movement immediately
-                      isGeneratingDialogue: true // Show loading state
-                    };
-                  }
-                  return agent;
-                });
-                
-                // Find the clicked agent and generate dialogue immediately
-                const updatedClickedAgent = updatedAgents.find(a => a.id === agentId);
-                if (updatedClickedAgent && isAiEnabled) {
-                  // Generate dialogue immediately for the clicked agent (queued to prevent concurrent calls)
-                  generateDialogueForAgent(updatedClickedAgent, updatedAgents, coreState, (agentId, dialogue, audioUrl) => {
-                    setAgents(current => current.map(agent => 
-                      agent.id === agentId 
-                        ? { 
-                            ...agent, 
-                            dialogue, 
-                            audioUrl, 
-                            lastDialogueTime: Date.now(),
-                            isGeneratingDialogue: false // Clear loading state
-                          }
-                        : agent
-                    ));
-                  }).catch(error => {
-                    // Clear loading state on error
-                    setAgents(current => current.map(agent => 
-                      agent.id === agentId 
-                        ? { ...agent, isGeneratingDialogue: false, state: 'PAUSING' as const }
-                        : agent
-                    ));
-                    console.error('Failed to generate dialogue:', error);
-                  });
-                }
-                
-                return updatedAgents;
-              });
-            }}
+            onAgentHover={(id) => setInteractingAgentId(id)}
           />
         </div>
-      ) : (
-        /* --- DIRECTOR MAP INTERFACE --- */
-        /* Replaced CSS opacity transition with conditional rendering to fix black screen bug */
+      )}
+
+      {/* DIY ERA LAYER */}
+      {activeView === 'DIY' && (
+        <div className="absolute inset-0 z-50 animate-in fade-in duration-700">
+            <DIYEraLuxPortal 
+              onBack={() => setActiveView('LOBBY')} 
+              onEnterZone={(id) => console.log("Entered Zone:", id)}
+            />
+        </div>
+      )}
+
+      {/* DIRECTOR MAP INTERFACE */}
+      {activeView === 'MAP' && (
         <div className="w-full h-full relative flex flex-col animate-in fade-in zoom-in-95 duration-1000">
           
-          {/* SVG VISUALIZATION BACKDROP */}
+          {/* DYNAMIC WEBGL MAP BACKDROP (Replaces SVG) */}
           {isInitialized && (
             <div className="absolute inset-0 z-0">
-               <SvgHotelBackdrop 
-                  atmosphere={coreState.activeAtmosphere}
-                  enabled={true}
+               <DirectorMapLayer 
                   rooms={rooms}
                   agents={agents}
-                  gridW={GRID_WIDTH}
-                  gridH={GRID_HEIGHT}
+                  selectedRoomId={selectedRoom?.id}
+                  onRoomSelect={setSelectedRoom}
                />
             </div>
           )}
@@ -240,7 +196,7 @@ const App: React.FC = () => {
              <div className="flex items-center gap-5 pointer-events-auto">
                 <div className="p-3 bg-cyan-500/10 rounded-xl border border-cyan-500/20"><Layers size={18} className="text-cyan-400"/></div>
                 <div>
-                    <h1 className="text-[11px] font-bold tracking-[0.4em] uppercase text-slate-100">SeedCore Director</h1>
+                    <h1 className="text--[11px] font-bold tracking-[0.4em] uppercase text-slate-100">SeedCore Director</h1>
                     <div className="text-[8px] text-cyan-500/40 font-mono tracking-widest uppercase mt-1">Plane: Topological • Grid: 80x44</div>
                 </div>
              </div>
@@ -259,7 +215,7 @@ const App: React.FC = () => {
                 </button>
 
                 <button 
-                  onClick={() => setInLobby(true)} 
+                  onClick={() => setActiveView('LOBBY')} 
                   className="px-8 py-2.5 bg-white text-black rounded-full text-[9px] font-bold uppercase tracking-[0.2em] transition-all hover:bg-cyan-400 shadow-xl"
                 >
                   FPV Mode
@@ -270,55 +226,99 @@ const App: React.FC = () => {
           {/* HUD SIDEBARS */}
           <SensoryTelemetryPanel active={isAiEnabled} />
           
-          {/* REPLACED OPERATIONS PANEL WITH CONCIERGE PANEL */}
           <ConciergePanel active={isAiEnabled} />
 
           {/* FOOTER INSPECTOR */}
           {selectedRoom && (
-             <div className="absolute bottom-12 left-1/2 -translate-x-1/2 w-[400px] bg-slate-950/60 backdrop-blur-2xl border border-cyan-500/30 p-6 rounded-2xl shadow-[0_0_60px_rgba(0,0,0,0.8)] z-40 animate-in slide-in-from-bottom-8 duration-500">
-                <div className="flex justify-between items-center mb-5">
+             <div className="absolute bottom-12 left-1/2 -translate-x-1/2 w-[480px] bg-slate-950/80 backdrop-blur-2xl border border-cyan-500/30 p-6 rounded-2xl shadow-[0_0_60px_rgba(0,0,0,0.8)] z-40 animate-in slide-in-from-bottom-8 duration-500">
+                <div className="flex justify-between items-center mb-5 border-b border-white/5 pb-4">
                    <div className="flex flex-col">
                      <h3 className="text-sm font-bold uppercase tracking-[0.2em] text-white">{selectedRoom.name}</h3>
-                     <span className="text-[8px] font-mono text-cyan-500/50 uppercase tracking-widest">Room Type: {selectedRoom.type}</span>
+                     <span className="text-[8px] font-mono text-cyan-500/50 uppercase tracking-widest">Type: {selectedRoom.type} • ID: {selectedRoom.id}</span>
                    </div>
                    <button onClick={() => setSelectedRoom(null)} className="p-2 hover:bg-white/10 rounded-full transition-all"><X size={16} className="text-slate-500" /></button>
                 </div>
-                <div className="grid grid-cols-2 gap-6 mb-8">
-                    <div className="p-3 bg-white/5 rounded-lg border border-white/5">
-                        <span className="text-[8px] uppercase font-mono text-slate-500 block mb-1">Status</span>
-                        <span className="text-[10px] font-mono text-emerald-400 uppercase tracking-widest">Operational</span>
+                
+                <div className="grid grid-cols-2 gap-3 mb-6">
+                    {/* Status */}
+                    <div className="p-3 bg-white/5 rounded-lg border border-white/5 flex items-center justify-between">
+                        <div>
+                           <span className="text-[8px] uppercase font-mono text-slate-500 block mb-1">Status</span>
+                           <span className="text-[10px] font-mono text-emerald-400 uppercase tracking-widest">Operational</span>
+                        </div>
+                        <Activity size={14} className="text-emerald-500/50" />
                     </div>
-                    <div className="p-3 bg-white/5 rounded-lg border border-white/5">
-                        <span className="text-[8px] uppercase font-mono text-slate-500 block mb-1">Grid Lock</span>
-                        <span className="text-[10px] font-mono text-cyan-300 uppercase tracking-widest">{selectedRoom.topLeft.x},{selectedRoom.topLeft.y}</span>
+                    {/* Grid Lock */}
+                    <div className="p-3 bg-white/5 rounded-lg border border-white/5 flex items-center justify-between">
+                        <div>
+                           <span className="text-[8px] uppercase font-mono text-slate-500 block mb-1">Grid Lock</span>
+                           <span className="text-[10px] font-mono text-cyan-300 uppercase tracking-widest">{selectedRoom.topLeft.x},{selectedRoom.topLeft.y}</span>
+                        </div>
+                        <Map size={14} className="text-cyan-500/50" />
+                    </div>
+
+                    {/* Temperature */}
+                    <div className="p-3 bg-white/5 rounded-lg border border-white/5 flex items-center justify-between">
+                        <div>
+                            <span className="text-[8px] uppercase font-mono text-slate-500 block mb-1">Temp</span>
+                            <span className="text-[10px] font-mono text-amber-300 uppercase tracking-widest">{envMetrics.temperature}°C</span>
+                        </div>
+                        <Thermometer size={14} className="text-amber-500/50" />
+                    </div>
+
+                    {/* Air Quality */}
+                    <div className="p-3 bg-white/5 rounded-lg border border-white/5 flex items-center justify-between">
+                        <div>
+                            <span className="text-[8px] uppercase font-mono text-slate-500 block mb-1">Air Quality</span>
+                            <span className="text-[10px] font-mono text-emerald-300 uppercase tracking-widest">AQI {envMetrics.aqi}</span>
+                        </div>
+                        <Wind size={14} className="text-emerald-500/50" />
+                    </div>
+
+                    {/* Lighting */}
+                    <div className="p-3 bg-white/5 rounded-lg border border-white/5 flex items-center justify-between">
+                        <div>
+                            <span className="text-[8px] uppercase font-mono text-slate-500 block mb-1">Lighting</span>
+                            <span className={`text-[10px] font-mono ${lighting.color} uppercase tracking-widest`}>{lighting.text}</span>
+                        </div>
+                        <Lightbulb size={14} className="text-yellow-500/50" />
+                    </div>
+                    
+                    {/* Humidity */}
+                    <div className="p-3 bg-white/5 rounded-lg border border-white/5 flex items-center justify-between">
+                        <div>
+                            <span className="text-[8px] uppercase font-mono text-slate-500 block mb-1">Humidity</span>
+                            <span className="text-[10px] font-mono text-blue-300 uppercase tracking-widest">{envMetrics.humidity}%</span>
+                        </div>
+                        <Droplets size={14} className="text-blue-500/50" />
                     </div>
                 </div>
+
+                {envMetrics.narrative && (
+                    <div className="mb-4 px-3 py-2 bg-emerald-500/10 border border-emerald-500/20 rounded-lg text-[9px] font-mono text-emerald-300 animate-in fade-in slide-in-from-bottom-2">
+                        <span className="font-bold mr-2">SYS.LOG:</span> {envMetrics.narrative}
+                    </div>
+                )}
+
                 <button 
-                    onClick={() => requestShot(`Holographic verification of ${selectedRoom.name}`)}
-                    disabled={!isAiEnabled}
-                    className={`w-full py-4 font-bold uppercase text-[9px] tracking-[0.3em] rounded-xl flex items-center justify-center gap-3 transition-all ${
-                      isAiEnabled ? 'bg-cyan-500 hover:bg-cyan-400 text-black shadow-lg shadow-cyan-500/20' : 'bg-slate-900 text-slate-600 cursor-not-allowed border border-slate-800'
+                    onClick={handleAdaptiveEnvironment}
+                    disabled={!isAiEnabled || isAdapting}
+                    className={`w-full py-3 font-bold uppercase text-[9px] tracking-[0.3em] rounded-xl flex items-center justify-center gap-3 transition-all ${
+                      isAiEnabled && !isAdapting ? 'bg-cyan-500 hover:bg-cyan-400 text-black shadow-lg shadow-cyan-500/20' : 'bg-slate-900 text-slate-600 cursor-not-allowed border border-slate-800'
                     }`}
                 >
-                    <Film size={14} /> {isAiEnabled ? 'Request Neural Feed' : 'Core Offline'}
+                    {isAdapting ? (
+                        <>
+                           <Loader2 size={14} className="animate-spin" /> Calculating...
+                        </>
+                    ) : (
+                        <>
+                           <RefreshCw size={14} /> {isAiEnabled ? 'Adaptive Environment' : 'Core Offline'}
+                        </>
+                    )}
                 </button>
              </div>
           )}
-        </div>
-      )}
-
-      {/* VIDEO MODAL */}
-      {(videoUrl || isVideoLoading) && (
-        <div className="absolute inset-0 z-[60] bg-black/90 flex items-center justify-center p-8">
-            <div className="relative w-full max-w-4xl aspect-video bg-black border border-slate-800 shadow-2xl flex items-center justify-center rounded-2xl overflow-hidden">
-                 {isVideoLoading ? (
-                    <div className="flex flex-col items-center gap-4">
-                      <Loader2 size={32} className="animate-spin text-cyan-500" />
-                      <span className="text-[10px] font-mono text-cyan-500 uppercase tracking-widest">Compiling Scene...</span>
-                    </div>
-                 ) : <video src={videoUrl!} autoPlay controls loop className="w-full h-full object-cover" />}
-                 <button onClick={() => { setVideoUrl(null); setIsVideoLoading(false); }} className="absolute top-6 right-6 p-2 bg-black/50 rounded-full text-white hover:bg-white/20 transition-all"><X size={20}/></button>
-            </div>
         </div>
       )}
     </div>

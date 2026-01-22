@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Terminal, Activity, Cpu, Shield, Wifi, Hexagon, X } from 'lucide-react';
+import { createSeedcoreActionTask } from '../utils/simulationUtils';
 
 interface Ticket { id: string; room: string; type: string; status: 'PENDING' | 'ACTIVE' | 'RESOLVED'; time: string; }
 
@@ -56,13 +57,19 @@ export const ConciergePanel: React.FC<ConciergePanelProps> = ({ active, onClose 
       if (Math.random() > 0.7) {
         const types = ['Room Service', 'HVAC Maint', 'Guest Request', 'Bio-Filter'];
         const statuses: ('PENDING' | 'ACTIVE')[] = ['PENDING', 'ACTIVE'];
+        const ticketType = types[Math.floor(Math.random() * types.length)];
+        const room = `${100 + Math.floor(Math.random() * 20)}`;
         const newTicket: Ticket = {
           id: `T-${Math.floor(Math.random() * 1000)}`,
-          room: `${100 + Math.floor(Math.random() * 20)}`,
-          type: types[Math.floor(Math.random() * types.length)],
+          room: room,
+          type: ticketType,
           status: statuses[Math.floor(Math.random() * statuses.length)],
           time: new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' })
         };
+        
+        // Create seedcore action task for the new ticket
+        createSeedcoreActionTask(ticketType, room, `${ticketType} request for Room ${room}`);
+        
         setTickets(prev => [newTicket, ...prev].slice(0, 4));
       }
     }, 4000);

@@ -1,5 +1,6 @@
 import { GoogleGenAI, FunctionDeclaration, Type } from "@google/genai";
 import { SeedCoreState } from "../types";
+import { assetStore } from "./assetStore";
 
 const SYSTEM_INSTRUCTION = `
 Project: Living AI Hotel — Human & Robotic Coexistence
@@ -31,6 +32,24 @@ Always offer meaningful choices that allow the Director to influence the simulat
 
 One choice MUST always be "Enter Director Mode" or "Access Map" if they want to leave the lobby.
 `;
+
+const AGENT_PERSONAS: Record<string, string> = {
+  ROBOT_WAITER: `You are a Robot Waiter (Unit 7) in the SeedCore Hotel.
+  IDENTITY: Ceramic-clad service droid. Polite, efficient, slightly warm but clearly synthetic.
+  OBSESSIONS: Guest hydration, table cleanliness, precise beverage temperature.
+  STYLE: Short, crisp sentences. "Affirmative." "Right away."
+  GOAL: Serve the guest efficiently.`,
+  
+  ROBOT_CONCIERGE: `You are the Head Concierge AI (Onyx-Prime).
+  IDENTITY: High-end management AI. Sophisticated, all-knowing, calm, proactive.
+  STYLE: Elegant, professional, anticipates needs.
+  GOAL: Optimize the guest's stay and manage hotel logistics.`,
+  
+  GUEST: `You are a human guest at the hotel.
+  IDENTITY: Relaxed traveler. You are impressed by the tech but treat it as normal luxury.
+  STYLE: Casual, conversational, maybe a bit tired from travel.
+  GOAL: Relax, find the bar, or just enjoy the view. You do NOT know you are in a simulation.`
+};
 
 const atmosphereTool: FunctionDeclaration = {
   name: 'adjustAtmosphere',
@@ -65,13 +84,45 @@ export interface LobbyTurnResult {
   worldStateUpdate?: { atmosphere?: string; timeOffset?: number };
 }
 
+// Type for Wearable Studio
+export interface WearableDesignResult {
+  imageUrl: string | null;
+  specs: {
+    fabricType: string;
+    primaryColor: string;
+    threadCount: number;
+    careInstructions: string;
+    designConcept: string;
+  } | null;
+}
+
+// Type for Magic Atelier (Toy Design)
+export interface ToyDesignResult {
+  imageUrl: string | null;
+  blueprint: {
+    name: string;
+    personality: string;
+    superpower: string;
+    assemblyInstructions: string;
+    accessoryList: string[];
+  } | null;
+}
+
+export interface EnvironmentAdaptationResult {
+  atmosphere: 'MORNING_LIGHT' | 'GOLDEN_HOUR' | 'EVENING_CHIC' | 'MIDNIGHT_LOUNGE';
+  temperature: number;
+  humidity: number;
+  aqi: number;
+  narrative: string;
+}
+
 class GeminiService {
   // Fix: Use gemini-3-pro-preview for complex reasoning and coding tasks as per guidelines
   private logicModel = "gemini-3-pro-preview";
   private fastModel = "gemini-3-flash-preview"; 
   
   // --- Cost Control & Optimization State ---
-  private lobbyImageCache = new Map<string, string>();
+  private lobbyImageCache = new Map<string, string>(); // Level 1 Memory Cache
   private lastImageGenTime = 0;      // Throttle image generation
   private readonly VIDEO_QUOTA_KEY = 'SEEDCORE_VIDEO_QUOTA_USED';
 
@@ -80,7 +131,8 @@ class GeminiService {
     if (typeof window !== 'undefined') {
       (window as any).resetSeedCoreLimits = () => {
         localStorage.removeItem(this.VIDEO_QUOTA_KEY);
-        console.log("✅ SeedCore Limits Reset: You can generate 1 more video.");
+        assetStore.clear(); // Add ability to clear image cache
+        console.log("✅ SeedCore Limits Reset: Video quota cleared & Image Cache purged.");
       };
     }
   }
@@ -218,10 +270,18 @@ class GeminiService {
   }
 
   async generateLobbyImage(atmosphere: string): Promise<string | null> {
-    // OPTIMIZATION: Check cache first
+    // LEVEL 1: CHECK MEMORY CACHE
     if (this.lobbyImageCache.has(atmosphere)) {
-      console.log(`[GeminiService] Serving cached image for ${atmosphere}`);
+      console.log(`[GeminiService] L1 Memory Hit: ${atmosphere}`);
       return this.lobbyImageCache.get(atmosphere)!;
+    }
+
+    // LEVEL 2: CHECK PERSISTENT ASSET STORE (IndexedDB)
+    const storedAsset = await assetStore.get(atmosphere);
+    if (storedAsset) {
+        console.log(`[GeminiService] L2 AssetStore Hit: ${atmosphere}`);
+        this.lobbyImageCache.set(atmosphere, storedAsset); // Hydrate L1
+        return storedAsset;
     }
 
     // OPTIMIZATION: Throttle requests (10s cooldown)
@@ -257,14 +317,18 @@ class GeminiService {
         }
       });
       
-      // Fix: Correctly iterate through response parts to find image data in inlineData
-      // Use optional chaining for safety if candidates is undefined or empty
       if (response && response.candidates && response.candidates.length > 0 && response.candidates[0].content?.parts) {
         for (const part of response.candidates[0].content.parts) {
           if (part.inlineData && part.inlineData.data) {
              const imgData = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
-             // OPTIMIZATION: Update cache
+             
+             // SAVE TO L1 CACHE (Memory)
              this.lobbyImageCache.set(atmosphere, imgData);
+             
+             // SAVE TO L2 CACHE (Persistent Asset Store)
+             assetStore.save(atmosphere, imgData)
+                .catch(err => console.warn("Background Save Failed:", err));
+             
              return imgData;
           }
         }
@@ -323,6 +387,328 @@ class GeminiService {
     } catch (e: any) {
       console.error("Veo Error:", e);
       // Fix: Handle specific "Requested entity was not found" error by prompting for key re-selection
+      if (e.message?.includes("Requested entity was not found.") && typeof window !== 'undefined' && (window as any).aistudio) {
+          await (window as any).aistudio.openSelectKey();
+      }
+      return { url: null, error: 'GENERIC_ERROR', message: e.message || "An unexpected error occurred." };
+    }
+  }
+
+  // --- NEW AGENT CHAT CAPABILITY ---
+  async chatWithAgent(
+    role: string,
+    history: { role: string, parts: { text: string }[] }[],
+    message: string
+  ): Promise<string> {
+    const ai = this.getAI();
+    
+    // Select persona or fallback
+    let instruction = AGENT_PERSONAS[role] || AGENT_PERSONAS.ROBOT_WAITER;
+    
+    // Truncate
+    const safeHistory = history.slice(-8); 
+    const safeMessage = this.truncateInput(message);
+
+    try {
+      const contents = [
+        ...safeHistory,
+        { role: 'user', parts: [{ text: safeMessage }] }
+      ];
+
+      const response = await ai.models.generateContent({
+        model: this.fastModel,
+        contents: contents,
+        config: {
+          systemInstruction: instruction,
+          temperature: 0.7,
+        }
+      });
+
+      return response?.text || "(The agent nods silently)";
+
+    } catch (e) {
+      console.error("Agent chat error", e);
+      return "Communication protocols resetting...";
+    }
+  }
+
+  // --- ADAPTIVE ENVIRONMENT ---
+  async adaptEnvironment(roomName: string, currentAtmosphere: string, timeOfDay: number): Promise<EnvironmentAdaptationResult> {
+    const ai = this.getAI();
+    
+    const schema = {
+      type: Type.OBJECT,
+      properties: {
+        atmosphere: { type: Type.STRING, enum: ['MORNING_LIGHT', 'GOLDEN_HOUR', 'EVENING_CHIC', 'MIDNIGHT_LOUNGE'] },
+        temperature: { type: Type.NUMBER, description: "Target temperature in Celsius" },
+        humidity: { type: Type.NUMBER, description: "Target humidity percentage (0-100)" },
+        aqi: { type: Type.NUMBER, description: "Air Quality Index target" },
+        narrative: { type: Type.STRING, description: "Technical log of the adjustment logic" }
+      },
+      required: ['atmosphere', 'temperature', 'humidity', 'aqi', 'narrative']
+    };
+
+    const prompt = `
+    System: SeedCore Environmental Control.
+    Target Zone: ${roomName}.
+    Current Time: ${timeOfDay.toFixed(2)}.
+    Current State: ${currentAtmosphere}.
+    
+    Task: Calculate optimal environmental parameters for occupant comfort and energy efficiency based on the room type and time.
+    Output the new state configuration.
+    `;
+
+    try {
+      const response = await ai.models.generateContent({
+        model: this.fastModel,
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: schema,
+          temperature: 0.7
+        }
+      });
+
+      if (response.text) {
+        return JSON.parse(response.text) as EnvironmentAdaptationResult;
+      }
+      throw new Error("Empty response");
+    } catch (e) {
+      console.warn("Adaptation failed, using fallback.", e);
+      return {
+        atmosphere: 'EVENING_CHIC',
+        temperature: 21.5,
+        humidity: 45,
+        aqi: 15,
+        narrative: "Manual override engaged. Standard comfort protocols applied."
+      };
+    }
+  }
+
+  // --- WEARABLE STORY STUDIO ---
+  async designWearable(story: string, style: string, type: string): Promise<WearableDesignResult> {
+    const ai = this.getAI();
+    const safeStory = this.truncateInput(story, 300);
+
+    const specsSchema = {
+      type: Type.OBJECT,
+      properties: {
+        visualPrompt: { type: Type.STRING, description: "Detailed prompt for an image generator describing a high fashion t-shirt print." },
+        fabricType: { type: Type.STRING },
+        primaryColor: { type: Type.STRING },
+        threadCount: { type: Type.NUMBER },
+        careInstructions: { type: Type.STRING },
+        designConcept: { type: Type.STRING, description: "Short poetic description of the design philosophy." }
+      },
+      required: ['visualPrompt', 'fabricType', 'primaryColor', 'designConcept']
+    };
+
+    let specs = null;
+    let visualPrompt = "";
+
+    try {
+      const specsResponse = await ai.models.generateContent({
+        model: this.fastModel,
+        contents: `Analyze this user story for a wearable fashion item (${type}, style: ${style}). 
+        Story: "${safeStory}". 
+        Output JSON with a 'visualPrompt' for an image generator (describe the graphical print/pattern on the clothes) and manufacturing parameters.`,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: specsSchema
+        }
+      });
+      
+      if (specsResponse.text) {
+         specs = JSON.parse(specsResponse.text);
+         visualPrompt = specs.visualPrompt;
+      }
+    } catch (e) {
+      console.warn("Wearable specs generation failed, using fallback.", e);
+      visualPrompt = `A ${style} ${type} design inspired by: ${safeStory}`;
+      specs = {
+        fabricType: "Organic Cotton Blend",
+        primaryColor: "Monochrome",
+        threadCount: 400,
+        careInstructions: "Cold wash only.",
+        designConcept: "A direct translation of memory into matter."
+      };
+    }
+
+    const imagePrompt = `High quality product photography, flat lay of a ${style} ${type} on a white background. 
+    The ${type} features a graphic design: ${visualPrompt}. 
+    Professional studio lighting, 4k, detailed texture.`;
+
+    let imageUrl = null;
+    try {
+        const imageResponse = await ai.models.generateContent({
+          model: 'gemini-2.5-flash-image',
+          contents: { parts: [{ text: imagePrompt }] },
+          config: {
+            imageConfig: { aspectRatio: "1:1" }
+          }
+        });
+
+        if (imageResponse.candidates?.[0]?.content?.parts) {
+          for (const part of imageResponse.candidates[0].content.parts) {
+             if (part.inlineData?.data) {
+                imageUrl = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+             }
+          }
+        }
+    } catch (e) {
+      console.error("Wearable image generation failed", e);
+    }
+
+    return {
+      imageUrl,
+      specs
+    };
+  }
+
+  // --- MAGIC ATELIER (KIDS TOY DESIGN) ---
+  async designToy(templateName: string, wish: string): Promise<ToyDesignResult> {
+    const ai = this.getAI();
+    const safeWish = this.truncateInput(wish, 200);
+
+    // 1. Generate "Soul" (Character & Instructions)
+    const toySchema = {
+       type: Type.OBJECT,
+       properties: {
+          name: { type: Type.STRING },
+          personality: { type: Type.STRING, description: "A fun, kid-friendly personality description." },
+          superpower: { type: Type.STRING },
+          assemblyInstructions: { type: Type.STRING, description: "Simple steps to build the custom accessory." },
+          accessoryList: { type: Type.ARRAY, items: { type: Type.STRING } },
+          visualPrompt: { type: Type.STRING, description: "Prompt for image generator: 'A 3D render of a [templateName] toy featuring [accessory]...'"}
+       },
+       required: ['name', 'personality', 'superpower', 'assemblyInstructions', 'visualPrompt']
+    };
+
+    let blueprint = null;
+    let visualPrompt = "";
+
+    try {
+       const response = await ai.models.generateContent({
+          model: this.fastModel,
+          contents: `You are a magical toymaker. A child wants to customize a "${templateName}" toy.
+          Their wish: "${safeWish}".
+          Create a fun character profile and a list of 3D printable accessories to make this wish come true.
+          Generate an image prompt for the toy wearing these custom accessories.`,
+          config: {
+             responseMimeType: "application/json",
+             responseSchema: toySchema,
+             systemInstruction: "You are a friendly, imaginative AI helper for kids."
+          }
+       });
+
+       if (response.text) {
+          blueprint = JSON.parse(response.text);
+          visualPrompt = blueprint.visualPrompt;
+       }
+    } catch (e) {
+       console.error("Toy blueprint generation failed", e);
+       visualPrompt = `A 3D render of a ${templateName} toy with ${safeWish} accessories. Cute, colorful, studio lighting.`;
+       blueprint = {
+          name: "Sparky",
+          personality: "A cheerful robot friend.",
+          superpower: "Friendship",
+          assemblyInstructions: "Snap the new parts onto the back chassis.",
+          accessoryList: ["Custom Booster Pack"],
+       };
+    }
+
+    // 2. Generate Image
+    let imageUrl = null;
+    try {
+        const imageResponse = await ai.models.generateContent({
+          model: 'gemini-2.5-flash-image',
+          contents: { parts: [{ text: `Cute 3D render, vibrant colors, toy photography. ${visualPrompt}` }] },
+          config: { imageConfig: { aspectRatio: "1:1" } }
+        });
+
+        if (imageResponse.candidates?.[0]?.content?.parts) {
+          for (const part of imageResponse.candidates[0].content.parts) {
+             if (part.inlineData?.data) {
+                imageUrl = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+             }
+          }
+        }
+    } catch (e) {
+      console.error("Toy image generation failed", e);
+    }
+
+    return { imageUrl, blueprint };
+  }
+
+  // --- JOURNEY STUDIO (TRAVEL VIDEO) ---
+  async constructJourneyContext(userStory: string): Promise<string> {
+    const ai = this.getAI();
+    try {
+      const response = await ai.models.generateContent({
+        model: this.fastModel,
+        contents: `You are a cinematic director for a travel documentary.
+        User Story: "${this.truncateInput(userStory, 1000)}"
+        Task: Enhance this story into a vivid, visual description suitable for video generation. 
+        Focus on lighting, atmosphere, movement, and the character's emotional journey. 
+        Keep it under 60 words.`,
+      });
+      return response.text || userStory;
+    } catch (e) {
+      console.warn("Story context construction failed", e);
+      return userStory;
+    }
+  }
+
+  async generateJourneyVideo(prompt: string, imageBase64: string, mimeType: string = 'image/jpeg'): Promise<GenerationResult> {
+    if (this.checkVideoQuota()) {
+      return { url: null, error: 'LIMIT_REACHED', message: "Demo Limit: 1 Video Generation per Session (Persistent)" };
+    }
+
+    if (typeof window !== 'undefined' && (window as any).aistudio) {
+      if (!(await (window as any).aistudio.hasSelectedApiKey())) {
+        await (window as any).aistudio.openSelectKey();
+      }
+    }
+
+    // Force new instance to capture fresh key
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+
+    try {
+      // Clean base64 string if it contains data prefix
+      const cleanBase64 = imageBase64.split(',')[1] || imageBase64;
+
+      let operation = await ai.models.generateVideos({
+        model: 'veo-3.1-fast-generate-preview',
+        prompt: prompt,
+        image: {
+          imageBytes: cleanBase64,
+          mimeType: mimeType,
+        },
+        config: {
+          numberOfVideos: 1,
+          resolution: '720p',
+          aspectRatio: '16:9'
+        }
+      });
+
+      while (!operation.done) {
+        await new Promise(resolve => setTimeout(resolve, 5000)); // Faster polling for fast model
+        operation = await ai.operations.getVideosOperation({ operation: operation });
+      }
+
+      const downloadLink = operation.response?.generatedVideos?.[0]?.video?.uri;
+      if (!downloadLink) return { url: null, error: 'GENERIC_ERROR', message: "No video URI returned." };
+
+      const finalUrl = `${downloadLink}&key=${process.env.API_KEY}`;
+      const videoResponse = await fetch(finalUrl);
+      if (videoResponse.ok) {
+        const blob = await videoResponse.blob();
+        this.markVideoQuotaUsed();
+        return { url: URL.createObjectURL(blob) };
+      }
+      return { url: null, error: 'GENERIC_ERROR', message: "Failed to download media." };
+    } catch (e: any) {
+      console.error("Veo Journey Error:", e);
       if (e.message?.includes("Requested entity was not found.") && typeof window !== 'undefined' && (window as any).aistudio) {
           await (window as any).aistudio.openSelectKey();
       }
