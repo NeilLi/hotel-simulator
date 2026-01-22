@@ -15,6 +15,7 @@ import express from 'express';
 import cors from 'cors';
 import { Pool } from 'pg';
 import crypto from 'crypto';
+import { Storage } from '@google-cloud/storage';
 
 const app = express();
 const PORT = process.env.DB_PROXY_PORT || 3001;
@@ -35,10 +36,9 @@ app.use(cors({
   },
   credentials: true
 }));
-// Increase body size limit to handle large payloads (e.g., design metadata with images)
-// Default is 100kb, increase to 10MB for wearable design data
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+// Increase body size limit to handle large base64 image payloads (50MB)
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // Database configuration (from environment or defaults matching docker/env.example)
 // Note: The actual database name is 'seedcore', not 'postgres' (see PG_DSN in env.example)
@@ -2600,6 +2600,452 @@ app.post('/api/validation/digital-twin', async (req, res) => {
   }
 });
 
+// Initialize Google Cloud Storage
+const storage = new Storage();
+const BUCKET_NAME = process.env.GCS_BUCKET_NAME || 'seedcore-designs-dev';
+
+// Initialize design uploads table (create if not exists)
+async function ensureDesignUploadsTable() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS design_uploads (
+        id SERIAL PRIMARY KEY,
+        run_id VARCHAR(255) NOT NULL,
+        suffix VARCHAR(50) NOT NULL CHECK (suffix IN ('print', 'mockup')),
+        gcs_url TEXT NOT NULL,
+        gcs_path TEXT NOT NULL,
+        applied BOOLEAN DEFAULT FALSE,
+        applied_at TIMESTAMPTZ,
+        metadata JSONB DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(run_id, suffix)
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_design_uploads_run_id ON design_uploads(run_id);
+      CREATE INDEX IF NOT EXISTS idx_design_uploads_applied ON design_uploads(applied);
+      CREATE INDEX IF NOT EXISTS idx_design_uploads_created_at ON design_uploads(created_at DESC);
+    `);
+    console.log('✅ Design uploads table ready');
+  } catch (error) {
+    console.warn('⚠️  Could not ensure design_uploads table:', error.message);
+  }
+}
+
+// Initialize table on startup
+ensureDesignUploadsTable();
+
+// Upload design image to Google Cloud Storage
+app.post('/api/designs/upload', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { imageUrl, runId, suffix, metadata } = req.body;
+
+    if (!imageUrl || !runId || !suffix) {
+      return res.status(400).json({ 
+        error: 'Missing required fields: imageUrl, runId, and suffix are required' 
+      });
+    }
+
+    if (!['print', 'mockup'].includes(suffix)) {
+      return res.status(400).json({ 
+        error: 'suffix must be either "print" or "mockup"' 
+      });
+    }
+
+    const bucket = storage.bucket(BUCKET_NAME);
+    const fileName = `designs/${runId}-${suffix}.png`;
+    const file = bucket.file(fileName);
+
+    let buffer;
+
+    // Handle data URLs (base64)
+    if (imageUrl.startsWith('data:')) {
+      const base64Data = imageUrl.split(',')[1];
+      buffer = Buffer.from(base64Data, 'base64');
+    } else {
+      // Handle regular URLs (fetch from Gemini's temporary URL)
+      const response = await fetch(imageUrl);
+      const arrayBuffer = await response.arrayBuffer();
+      buffer = Buffer.from(arrayBuffer);
+    }
+
+    // Upload to GCS
+    // Note: With uniform bucket-level access enabled, we can't set per-object ACLs.
+    // Ensure the bucket has bucket-level IAM policy with allUsers having 
+    // roles/storage.objectViewer role for public read access.
+    await file.save(buffer, {
+      metadata: { 
+        contentType: 'image/png',
+        metadata: {
+          runId: runId,
+          suffix: suffix,
+          uploadedAt: new Date().toISOString(),
+          ...(metadata || {})
+        }
+      },
+    });
+
+    // Return the permanent URL
+    const permanentUrl = `https://storage.googleapis.com/${BUCKET_NAME}/${fileName}`;
+
+    // Store upload record in database
+    await client.query('BEGIN');
+    try {
+      const result = await client.query(`
+        INSERT INTO design_uploads (run_id, suffix, gcs_url, gcs_path, metadata)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (run_id, suffix) 
+        DO UPDATE SET
+          gcs_url = EXCLUDED.gcs_url,
+          gcs_path = EXCLUDED.gcs_path,
+          metadata = EXCLUDED.metadata,
+          updated_at = NOW()
+        RETURNING id, run_id, suffix, gcs_url, applied, created_at, updated_at
+      `, [runId, suffix, permanentUrl, fileName, JSON.stringify(metadata || {})]);
+
+      await client.query('COMMIT');
+      
+      const row = result.rows[0];
+      res.json({ 
+        id: row.id,
+        runId: row.run_id,
+        suffix: row.suffix,
+        url: row.gcs_url,
+        applied: row.applied,
+        createdAt: row.created_at.toISOString(),
+        updatedAt: row.updated_at.toISOString()
+      });
+    } catch (dbError) {
+      await client.query('ROLLBACK');
+      // Still return success if GCS upload succeeded, but log DB error
+      console.warn('Failed to store design upload record:', dbError.message);
+      res.json({ 
+        runId,
+        suffix,
+        url: permanentUrl,
+        applied: false,
+        warning: 'Upload succeeded but database record failed'
+      });
+    }
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error uploading design to GCS:', error);
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Get design uploads history
+app.get('/api/designs', async (req, res) => {
+  try {
+    const { runId, suffix, applied, limit } = req.query;
+    
+    let query = `
+      SELECT 
+        id, run_id, suffix, gcs_url, gcs_path, applied, applied_at,
+        metadata, created_at, updated_at
+      FROM design_uploads
+      WHERE 1=1
+    `;
+    const params = [];
+    let paramIndex = 1;
+
+    if (runId) {
+      query += ` AND run_id = $${paramIndex++}`;
+      params.push(runId);
+    }
+
+    if (suffix) {
+      query += ` AND suffix = $${paramIndex++}`;
+      params.push(suffix);
+    }
+
+    if (applied !== undefined) {
+      query += ` AND applied = $${paramIndex++}`;
+      params.push(applied === 'true');
+    }
+
+    query += ` ORDER BY created_at DESC`;
+
+    if (limit) {
+      const limitNum = parseInt(limit);
+      if (limitNum > 0) {
+        query += ` LIMIT $${paramIndex++}`;
+        params.push(limitNum);
+      }
+    }
+
+    const result = await pool.query(query, params);
+
+    res.json(result.rows.map(row => ({
+      id: row.id,
+      runId: row.run_id,
+      suffix: row.suffix,
+      url: row.gcs_url,
+      gcsPath: row.gcs_path,
+      applied: row.applied,
+      appliedAt: row.applied_at ? row.applied_at.toISOString() : null,
+      metadata: row.metadata || {},
+      createdAt: row.created_at.toISOString(),
+      updatedAt: row.updated_at.toISOString(),
+    })));
+  } catch (error) {
+    console.error('Error fetching design uploads:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get design uploads for a specific runId (grouped by suffix)
+app.get('/api/designs/run/:runId', async (req, res) => {
+  try {
+    const { runId } = req.params;
+    
+    const result = await pool.query(`
+      SELECT 
+        id, run_id, suffix, gcs_url, gcs_path, applied, applied_at,
+        metadata, created_at, updated_at
+      FROM design_uploads
+      WHERE run_id = $1
+      ORDER BY suffix, created_at DESC
+    `, [runId]);
+
+    // Group by suffix
+    const grouped = {
+      print: null,
+      mockup: null,
+      history: []
+    };
+
+    result.rows.forEach(row => {
+      const design = {
+        id: row.id,
+        runId: row.run_id,
+        suffix: row.suffix,
+        url: row.gcs_url,
+        gcsPath: row.gcs_path,
+        applied: row.applied,
+        appliedAt: row.applied_at ? row.applied_at.toISOString() : null,
+        metadata: row.metadata || {},
+        createdAt: row.created_at.toISOString(),
+        updatedAt: row.updated_at.toISOString(),
+      };
+
+      // Set latest as primary, older ones in history
+      if (grouped[row.suffix] === null) {
+        grouped[row.suffix] = design;
+      } else {
+        grouped.history.push(design);
+      }
+    });
+
+    res.json(grouped);
+  } catch (error) {
+    console.error('Error fetching design uploads for run:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get a specific design upload
+app.get('/api/designs/:runId/:suffix', async (req, res) => {
+  try {
+    const { runId, suffix } = req.params;
+
+    if (!['print', 'mockup'].includes(suffix)) {
+      return res.status(400).json({ 
+        error: 'suffix must be either "print" or "mockup"' 
+      });
+    }
+
+    const result = await pool.query(`
+      SELECT 
+        id, run_id, suffix, gcs_url, gcs_path, applied, applied_at,
+        metadata, created_at, updated_at
+      FROM design_uploads
+      WHERE run_id = $1 AND suffix = $2
+      ORDER BY created_at DESC
+      LIMIT 1
+    `, [runId, suffix]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ 
+        error: `Design not found: ${runId}-${suffix}` 
+      });
+    }
+
+    const row = result.rows[0];
+    res.json({
+      id: row.id,
+      runId: row.run_id,
+      suffix: row.suffix,
+      url: row.gcs_url,
+      gcsPath: row.gcs_path,
+      applied: row.applied,
+      appliedAt: row.applied_at ? row.applied_at.toISOString() : null,
+      metadata: row.metadata || {},
+      createdAt: row.created_at.toISOString(),
+      updatedAt: row.updated_at.toISOString(),
+    });
+  } catch (error) {
+    console.error('Error fetching design upload:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Mark design as applied
+app.post('/api/designs/:runId/:suffix/apply', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { runId, suffix } = req.params;
+    const { applied = true } = req.body;
+
+    if (!['print', 'mockup'].includes(suffix)) {
+      return res.status(400).json({ 
+        error: 'suffix must be either "print" or "mockup"' 
+      });
+    }
+
+    await client.query('BEGIN');
+
+    const result = await client.query(`
+      UPDATE design_uploads
+      SET 
+        applied = $1,
+        applied_at = CASE WHEN $1 = TRUE THEN NOW() ELSE NULL END,
+        updated_at = NOW()
+      WHERE run_id = $2 AND suffix = $3
+      RETURNING id, run_id, suffix, gcs_url, applied, applied_at, created_at, updated_at
+    `, [applied, runId, suffix]);
+
+    if (result.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ 
+        error: `Design not found: ${runId}-${suffix}` 
+      });
+    }
+
+    await client.query('COMMIT');
+
+    const row = result.rows[0];
+    res.json({
+      id: row.id,
+      runId: row.run_id,
+      suffix: row.suffix,
+      url: row.gcs_url,
+      applied: row.applied,
+      appliedAt: row.applied_at ? row.applied_at.toISOString() : null,
+      createdAt: row.created_at.toISOString(),
+      updatedAt: row.updated_at.toISOString(),
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error updating design applied status:', error);
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Get design image directly (proxy from GCS)
+app.get('/api/designs/:runId/:suffix/image', async (req, res) => {
+  try {
+    const { runId, suffix } = req.params;
+
+    if (!['print', 'mockup'].includes(suffix)) {
+      return res.status(400).json({ 
+        error: 'suffix must be either "print" or "mockup"' 
+      });
+    }
+
+    const fileName = `designs/${runId}-${suffix}.png`;
+    const file = storage.bucket(BUCKET_NAME).file(fileName);
+
+    // Check if file exists
+    const [exists] = await file.exists();
+    if (!exists) {
+      return res.status(404).json({ 
+        error: `Design image not found: ${runId}-${suffix}` 
+      });
+    }
+
+    // Stream file from GCS
+    const stream = file.createReadStream();
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Cache-Control', 'public, max-age=31536000'); // Cache for 1 year
+    stream.pipe(res);
+  } catch (error) {
+    console.error('Error fetching design image:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get latest designs grouped by runId
+app.get('/api/designs/latest', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit || '20');
+    
+    // Get latest designs, one per (runId, suffix) combination
+    const result = await pool.query(`
+      SELECT DISTINCT ON (run_id, suffix)
+        id, run_id, suffix, gcs_url, gcs_path, applied, applied_at,
+        metadata, created_at, updated_at
+      FROM design_uploads
+      ORDER BY run_id, suffix, created_at DESC
+      LIMIT $1
+    `, [limit]);
+
+    // Group by runId
+    const grouped = {};
+
+    result.rows.forEach(row => {
+      const runId = row.run_id;
+      if (!grouped[runId]) {
+        grouped[runId] = {
+          runId,
+          print: null,
+          mockup: null,
+          latestAt: row.created_at.toISOString()
+        };
+      }
+
+      const design = {
+        id: row.id,
+        runId: row.run_id,
+        suffix: row.suffix,
+        url: row.gcs_url,
+        gcsPath: row.gcs_path,
+        applied: row.applied,
+        appliedAt: row.applied_at ? row.applied_at.toISOString() : null,
+        metadata: row.metadata || {},
+        createdAt: row.created_at.toISOString(),
+        updatedAt: row.updated_at.toISOString(),
+      };
+
+      if (row.suffix === 'print') {
+        grouped[runId].print = design;
+      } else if (row.suffix === 'mockup') {
+        grouped[runId].mockup = design;
+      }
+
+      // Update latest timestamp
+      if (row.created_at > new Date(grouped[runId].latestAt)) {
+        grouped[runId].latestAt = row.created_at.toISOString();
+      }
+    });
+
+    // Convert to array and sort by latestAt
+    const designs = Object.values(grouped).sort((a, b) => 
+      new Date(b.latestAt).getTime() - new Date(a.latestAt).getTime()
+    );
+
+    res.json(designs);
+  } catch (error) {
+    console.error('Error fetching latest designs:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // POST /api/policy/evaluate-temporal - Step 6: Temporal policy evaluation
 app.post('/api/policy/evaluate-temporal', async (req, res) => {
   try {
@@ -2716,6 +3162,13 @@ app.listen(PORT, () => {
   console.log(`   POST   /api/design/govern`);
   console.log(`   POST   /api/validation/digital-twin`);
   console.log(`   POST   /api/policy/evaluate-temporal`);
+  console.log(`   POST   /api/designs/upload`);
+  console.log(`   GET    /api/designs`);
+  console.log(`   GET    /api/designs/latest`);
+  console.log(`   GET    /api/designs/run/:runId`);
+  console.log(`   GET    /api/designs/:runId/:suffix`);
+  console.log(`   GET    /api/designs/:runId/:suffix/image`);
+  console.log(`   POST   /api/designs/:runId/:suffix/apply`);
   console.log(`   WS     /api/design/govern-stream`);
   const dbName = process.env.POSTGRES_DB || 'seedcore';
   console.log(`📊 Connected to PostgreSQL at ${process.env.POSTGRES_HOST || 'localhost'}:${process.env.POSTGRES_PORT || '5432'}/${dbName}`);
