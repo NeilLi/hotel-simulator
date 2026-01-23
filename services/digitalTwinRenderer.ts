@@ -99,7 +99,7 @@ export class MockRenderService {
       const pw = Math.max((printImg as any).naturalWidth || printImg.width || 0, 0);
       const ph = Math.max((printImg as any).naturalHeight || printImg.height || 0, 0);
 
-      const scale = typeof params.scale === 'number' && params.scale > 0 ? params.scale : 0.45;
+      const scale = typeof params.scale === 'number' && params.scale > 0 ? params.scale : 0.38;
       const scaledW = pw * scale;
       const scaledH = ph * scale;
 
@@ -109,8 +109,8 @@ export class MockRenderService {
       let y = canvas.height / 2 - scaledH / 2;
 
       if (anchor === 'center_chest' || anchor.includes('front')) {
-        // Position lower on the chest - moved from 0.35 to 0.42 for more centered, lower placement
-        y = canvas.height * 0.42 - scaledH / 2;
+        // Position lower on the chest for more comfortable production position
+        y = canvas.height * 0.47 - scaledH / 2;
       } else if (anchor === 'center_back' || anchor.includes('back')) {
         y = canvas.height * 0.5 - scaledH / 2;
       }

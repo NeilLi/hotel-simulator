@@ -17,7 +17,7 @@ interface VirtualLobbyProps {
 }
 
 // STRATEGY: Use a High-Res External URL for the default lobby background (static fallback).
-const USER_LOBBY_IMAGE = "https://raw.githubusercontent.com/NeilLi/seedcore-hotel-simulator/main/public/images/lobby.png";
+const USER_LOBBY_IMAGE = "/images/lobby.png";
 
 // SAFETY: Helper to sanitize image sources.
 const safeImageSrc = (src?: string | null) => {

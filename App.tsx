@@ -62,6 +62,7 @@ const App: React.FC = () => {
   const [isInitialized, setIsInitialized] = useState(false);
   const [activeView, setActiveView] = useState<'LOBBY' | 'MAP' | 'DIY'>('LOBBY');
   const [isAiEnabled, setIsAiEnabled] = useState(false);
+  const [isLiveMode, setIsLiveMode] = useState(false); // Controls sensor/concierge panel visibility
   
   const [grid, setGrid] = useState<EntityType[][]>([]);
   const [rooms, setRooms] = useState<Room[]>([]);
@@ -203,15 +204,15 @@ const App: React.FC = () => {
 
              <div className="flex items-center gap-6 pointer-events-auto">
                 <button 
-                  onClick={() => setIsAiEnabled(!isAiEnabled)}
+                  onClick={() => setIsLiveMode(!isLiveMode)}
                   className={`flex items-center gap-3 px-6 py-2.5 rounded-full border transition-all duration-500 ${
-                    isAiEnabled 
+                    isLiveMode 
                       ? 'bg-cyan-500/10 border-cyan-500/50 text-cyan-400 shadow-[0_0_20px_rgba(34,211,238,0.2)]' 
                       : 'bg-slate-900/50 border-slate-800 text-slate-600 hover:text-slate-400'
                   }`}
                 >
-                  <Power size={12} className={isAiEnabled ? "animate-pulse" : ""} />
-                  <span className="text-[9px] font-bold uppercase tracking-[0.2em]">{isAiEnabled ? 'Core Live' : 'Core Standby'}</span>
+                  <Power size={12} className={isLiveMode ? "animate-pulse" : ""} />
+                  <span className="text-[9px] font-bold uppercase tracking-[0.2em]">{isLiveMode ? 'Core Live' : 'Core Standby'}</span>
                 </button>
 
                 <button 
@@ -223,10 +224,9 @@ const App: React.FC = () => {
              </div>
           </header>
 
-          {/* HUD SIDEBARS */}
-          <SensoryTelemetryPanel active={isAiEnabled} />
-          
-          <ConciergePanel active={isAiEnabled} />
+          {/* HUD SIDEBARS - Controlled by live switch (hidden by default) */}
+          {isLiveMode && <SensoryTelemetryPanel active={isLiveMode} />}
+          {isLiveMode && <ConciergePanel active={isLiveMode} />}
 
           {/* FOOTER INSPECTOR */}
           {selectedRoom && (

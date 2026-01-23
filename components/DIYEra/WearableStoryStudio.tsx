@@ -76,6 +76,7 @@ type StudioState = {
 
   showPreview: boolean;
   previewSnapshot: string | null;
+  previewPKGResponse: PKGEvaluateResponse | null;
 
   designHistory: DesignHistory | null;
   loadingHistory: boolean;
@@ -90,7 +91,7 @@ type StudioAction =
   | { type: 'SET_TICKET'; ticket: WearableTicket | null }
   | { type: 'SET_ERROR'; error: string | null }
   | { type: 'SET_NOTIFICATION'; notification: { message: string; taskId?: string; isError?: boolean } | null }
-  | { type: 'SET_PREVIEW'; show: boolean; snapshot?: string | null }
+  | { type: 'SET_PREVIEW'; show: boolean; snapshot?: string | null; pkgResponse?: PKGEvaluateResponse | null }
   | { type: 'SET_DESIGN_HISTORY'; history: DesignHistory | null }
   | { type: 'SET_LOADING_HISTORY'; loading: boolean }
   | { type: 'UPDATE_DESIGN_APPLIED'; runId: string; suffix: 'print' | 'mockup'; applied: boolean }
@@ -114,6 +115,7 @@ const initialState: StudioState = {
 
   showPreview: false,
   previewSnapshot: null,
+  previewPKGResponse: null,
 
   designHistory: null,
   loadingHistory: false,
@@ -138,7 +140,12 @@ function reducer(state: StudioState, action: StudioAction): StudioState {
     case 'SET_NOTIFICATION':
       return { ...state, notification: action.notification };
     case 'SET_PREVIEW':
-      return { ...state, showPreview: action.show, previewSnapshot: action.snapshot ?? null };
+      return { 
+        ...state, 
+        showPreview: action.show, 
+        previewSnapshot: action.snapshot ?? null,
+        previewPKGResponse: action.pkgResponse ?? (action.show ? state.previewPKGResponse : null)
+      };
     case 'SET_DESIGN_HISTORY':
       return { ...state, designHistory: action.history };
     case 'SET_LOADING_HISTORY':
@@ -407,7 +414,7 @@ export function WearableStoryStudio({ onBack }: Props) {
     }
 
     dispatch({ type: 'SET_STATUS', status: 'generating' });
-    dispatch({ type: 'SET_PREVIEW', show: true, snapshot: null });
+    dispatch({ type: 'SET_PREVIEW', show: true, snapshot: null, pkgResponse: null });
     dispatch({ type: 'SET_ERROR', error: null });
 
     try {
@@ -417,7 +424,7 @@ export function WearableStoryStudio({ onBack }: Props) {
 
       if (!pkgResponse?.decision?.allowed) {
         dispatch({ type: 'SET_ERROR', error: `Policy Refusal: ${pkgResponse?.decision?.reason || 'Safety criteria not met.'}` });
-        dispatch({ type: 'SET_PREVIEW', show: false });
+        dispatch({ type: 'SET_PREVIEW', show: false, pkgResponse: null });
         dispatch({ type: 'SET_STATUS', status: 'error' });
         return;
       }
@@ -454,7 +461,7 @@ export function WearableStoryStudio({ onBack }: Props) {
         placement_anchor:
           params.placement_anchor ||
           (state.designDraft.printSpec?.placement?.toLowerCase().includes('front') ? 'center_chest' : 'center_back'),
-        scale: typeof params.scale === 'number' ? params.scale : 0.45,
+        scale: typeof params.scale === 'number' ? params.scale : 0.38,
         warp_profile:
           params.warp_profile || (state.designDraft.fabricType.toLowerCase().includes('cotton') ? 'loose_cotton' : 'standard'),
       };
@@ -466,7 +473,7 @@ export function WearableStoryStudio({ onBack }: Props) {
         state.designDraft
       );
 
-      dispatch({ type: 'SET_PREVIEW', show: true, snapshot: previewSnapshot });
+      dispatch({ type: 'SET_PREVIEW', show: true, snapshot: previewSnapshot, pkgResponse });
       dispatch({ type: 'SET_STATUS', status: 'review' });
     } catch (e: any) {
       const msg = e?.message || String(e);
@@ -480,7 +487,7 @@ export function WearableStoryStudio({ onBack }: Props) {
       }
 
       dispatch({ type: 'SET_ERROR', error: userMessage });
-      dispatch({ type: 'SET_PREVIEW', show: false });
+      dispatch({ type: 'SET_PREVIEW', show: false, pkgResponse: null });
       dispatch({ type: 'SET_STATUS', status: 'error' });
     }
   }, [state.designDraft, state.runId, intent, snapshot]);
@@ -629,12 +636,33 @@ export function WearableStoryStudio({ onBack }: Props) {
                   <p className="text-[10px] md:text-xs text-slate-500 font-medium">SeedCore Precision Mockup</p>
                 </div>
               </div>
-              <button
-                onClick={() => dispatch({ type: 'SET_PREVIEW', show: false })}
-                className="p-2 rounded-full hover:bg-white/80 text-slate-500 hover:text-slate-900 transition-colors"
-              >
-                <X size={18} />
-              </button>
+              <div className="flex items-center gap-3">
+                {state.previewPKGResponse && (
+                  <div className={`px-3 py-1.5 rounded-full text-[10px] md:text-xs font-bold flex items-center gap-1.5 ${
+                    state.previewPKGResponse.decision?.allowed
+                      ? 'bg-emerald-100 text-emerald-700 border border-emerald-200'
+                      : 'bg-rose-100 text-rose-700 border border-rose-200'
+                  }`}>
+                    {state.previewPKGResponse.decision?.allowed ? (
+                      <>
+                        <CheckCircle2 size={14} />
+                        PKG: Allowed
+                      </>
+                    ) : (
+                      <>
+                        <ShieldX size={14} />
+                        PKG: Blocked
+                      </>
+                    )}
+                  </div>
+                )}
+                <button
+                  onClick={() => dispatch({ type: 'SET_PREVIEW', show: false, pkgResponse: null })}
+                  className="p-2 rounded-full hover:bg-white/80 text-slate-500 hover:text-slate-900 transition-colors"
+                >
+                  <X size={18} />
+                </button>
+              </div>
             </div>
 
             <div className="flex-1 overflow-y-auto p-3 md:p-4">
@@ -664,7 +692,7 @@ export function WearableStoryStudio({ onBack }: Props) {
                         Anchor: {state.designDraft?.printSpec?.placement?.toLowerCase() || 'center_chest'}
                       </div>
                       <div className="px-2 md:px-3 py-1 md:py-1.5 bg-blue-600/90 text-white rounded-md md:rounded-lg font-semibold">
-                        Scale: 0.45
+                        Scale: 0.38
                       </div>
                       <div className="px-2 md:px-3 py-1 md:py-1.5 bg-blue-600/90 text-white rounded-md md:rounded-lg font-semibold">
                         Warp: {state.designDraft?.fabricType.toLowerCase().includes('cotton') ? 'loose_cotton' : 'standard'}
@@ -674,7 +702,7 @@ export function WearableStoryStudio({ onBack }: Props) {
 
                   <div className="flex-shrink-0 grid grid-cols-2 md:grid-cols-4 gap-2">
                     <InfoTile title="Placement Anchor" value={state.designDraft?.printSpec?.placement || 'center_chest'} tone="blue" />
-                    <InfoTile title="Scale Factor" value="0.45" tone="indigo" />
+                    <InfoTile title="Scale Factor" value="0.38" tone="indigo" />
                     <InfoTile
                       title="Warp Profile"
                       value={state.designDraft?.fabricType.toLowerCase().includes('cotton') ? 'loose_cotton' : 'standard'}
@@ -689,6 +717,14 @@ export function WearableStoryStudio({ onBack }: Props) {
                       In production, this would render a full 3D scene using Three.js with precise UV mapping and warp profiles for deterministic
                       manufacturing alignment.
                     </p>
+                  </div>
+
+                  <div className="flex-shrink-0 mt-4">
+                    <ActionsBar
+                      disabled={!state.previewSnapshot || isBusy || !state.designDraft}
+                      submitting={state.status === 'submitting'}
+                      onSubmit={handleSubmit}
+                    />
                   </div>
                 </div>
               ) : (
@@ -822,14 +858,6 @@ export function WearableStoryStudio({ onBack }: Props) {
                       {state.designDraft ? (
                         <>
                           <DesignPreview design={state.designDraft} type={state.type} />
-
-                          <div className="mt-8">
-                            <ActionsBar
-                              disabled={!state.policyDecision?.allowed || isBusy}
-                              submitting={state.status === 'submitting'}
-                              onSubmit={handleSubmit}
-                            />
-                          </div>
                         </>
                       ) : state.designHistory ? (
                         <DesignPreviewFromHistory 
