@@ -18,6 +18,9 @@ import {
   Wand2,
   X,
   Box,
+  ZoomIn,
+  ZoomOut,
+  RotateCcw,
 } from 'lucide-react';
 
 import { wearableStudioService } from '../../services/wearableStudioService';
@@ -676,16 +679,7 @@ export function WearableStoryStudio({ onBack }: Props) {
                       </div>
                     </div>
 
-                    <div className="flex-1 flex items-center justify-center min-h-0 overflow-auto">
-                      <div className="w-full h-full flex items-center justify-center">
-                        <img
-                          src={state.previewSnapshot}
-                          alt="3D Digital Twin Preview"
-                          className="max-w-[95%] max-h-[95%] w-auto h-auto object-contain rounded-lg md:rounded-xl shadow-2xl border-2 md:border-4 border-white"
-                          style={{ imageRendering: 'auto' }}
-                        />
-                      </div>
-                    </div>
+                    <ZoomablePreviewImage imageSrc={state.previewSnapshot} />
 
                     <div className="flex-shrink-0 mt-2 md:mt-3 flex flex-wrap gap-1.5 md:gap-2 text-[10px] md:text-xs">
                       <div className="px-2 md:px-3 py-1 md:py-1.5 bg-blue-600/90 text-white rounded-md md:rounded-lg font-semibold">
@@ -1044,6 +1038,169 @@ function PolicyStatusPanel(props: { snapshot: Snapshot | null; decision: PolicyD
             Hits: {decision.ruleHits.slice(0, 3).map((hit) => hit.ruleName).join(', ')}
           </div>
         ) : null}
+      </div>
+    </div>
+  );
+}
+
+function ZoomablePreviewImage({ imageSrc }: { imageSrc: string | null }) {
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [isDragging, setIsDragging] = useState(false);
+  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
+  const containerRef = useRef<HTMLDivElement>(null);
+  const imageRef = useRef<HTMLImageElement>(null);
+
+  const MIN_ZOOM = 0.5;
+  const MAX_ZOOM = 5;
+  const ZOOM_STEP = 0.25;
+
+  const handleZoomIn = useCallback(() => {
+    setZoom((prev) => Math.min(prev + ZOOM_STEP, MAX_ZOOM));
+  }, []);
+
+  const handleZoomOut = useCallback(() => {
+    setZoom((prev) => {
+      const newZoom = Math.max(prev - ZOOM_STEP, MIN_ZOOM);
+      if (newZoom === 1) {
+        setPan({ x: 0, y: 0 });
+      }
+      return newZoom;
+    });
+  }, []);
+
+  const handleReset = useCallback(() => {
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
+  }, []);
+
+  const handleWheel = useCallback((e: React.WheelEvent) => {
+    if (!e.ctrlKey && !e.metaKey) return;
+    e.preventDefault();
+    
+    const delta = e.deltaY > 0 ? -ZOOM_STEP : ZOOM_STEP;
+    setZoom((prev) => {
+      const newZoom = Math.max(MIN_ZOOM, Math.min(prev + delta, MAX_ZOOM));
+      if (newZoom === 1) {
+        setPan({ x: 0, y: 0 });
+      }
+      return newZoom;
+    });
+  }, []);
+
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    if (zoom <= 1) return;
+    e.preventDefault();
+    setIsDragging(true);
+    setDragStart({ 
+      x: e.clientX - pan.x, 
+      y: e.clientY - pan.y 
+    });
+  }, [zoom, pan]);
+
+  const handleMouseMove = useCallback((e: React.MouseEvent) => {
+    if (!isDragging || zoom <= 1) return;
+    e.preventDefault();
+    const newPan = {
+      x: e.clientX - dragStart.x,
+      y: e.clientY - dragStart.y,
+    };
+    setPan(newPan);
+  }, [isDragging, zoom, dragStart]);
+
+  const handleMouseUp = useCallback(() => {
+    setIsDragging(false);
+  }, []);
+
+  useEffect(() => {
+    const handleGlobalMouseUp = () => setIsDragging(false);
+    const handleGlobalMouseMove = (e: MouseEvent) => {
+      if (!isDragging || zoom <= 1) return;
+      const newPan = {
+        x: e.clientX - dragStart.x,
+        y: e.clientY - dragStart.y,
+      };
+      setPan(newPan);
+    };
+
+    if (isDragging) {
+      window.addEventListener('mousemove', handleGlobalMouseMove);
+      window.addEventListener('mouseup', handleGlobalMouseUp);
+      return () => {
+        window.removeEventListener('mousemove', handleGlobalMouseMove);
+        window.removeEventListener('mouseup', handleGlobalMouseUp);
+      };
+    }
+  }, [isDragging, zoom, dragStart]);
+
+  if (!imageSrc) return null;
+
+  return (
+    <div className="flex-1 flex flex-col min-h-0 relative">
+      {/* Zoom Controls */}
+      <div className="absolute top-2 right-2 z-10 flex flex-col gap-1 bg-white/90 backdrop-blur-sm rounded-lg p-1 shadow-lg border border-slate-200">
+        <button
+          onClick={handleZoomIn}
+          disabled={zoom >= MAX_ZOOM}
+          className="p-2 rounded-md hover:bg-slate-100 text-slate-700 hover:text-slate-900 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          title="Zoom In (Ctrl/Cmd + Scroll)"
+        >
+          <ZoomIn size={16} />
+        </button>
+        <button
+          onClick={handleZoomOut}
+          disabled={zoom <= MIN_ZOOM}
+          className="p-2 rounded-md hover:bg-slate-100 text-slate-700 hover:text-slate-900 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          title="Zoom Out (Ctrl/Cmd + Scroll)"
+        >
+          <ZoomOut size={16} />
+        </button>
+        <button
+          onClick={handleReset}
+          disabled={zoom === 1 && pan.x === 0 && pan.y === 0}
+          className="p-2 rounded-md hover:bg-slate-100 text-slate-700 hover:text-slate-900 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          title="Reset Zoom"
+        >
+          <RotateCcw size={16} />
+        </button>
+      </div>
+
+      {/* Zoom Level Indicator */}
+      {zoom !== 1 && (
+        <div className="absolute top-2 left-2 z-10 px-2 py-1 bg-white/90 backdrop-blur-sm rounded-md text-[10px] font-bold text-slate-700 shadow-lg border border-slate-200">
+          {Math.round(zoom * 100)}%
+        </div>
+      )}
+
+      {/* Image Container */}
+      <div
+        ref={containerRef}
+        className="flex-1 flex items-center justify-center min-h-0 overflow-hidden relative"
+        onWheel={handleWheel}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
+        onMouseLeave={handleMouseUp}
+        style={{
+          cursor: zoom > 1 ? (isDragging ? 'grabbing' : 'grab') : 'default',
+        }}
+      >
+        <div
+          className="w-full h-full flex items-center justify-center transition-transform duration-200 ease-out"
+          style={{
+            transform: `scale(${zoom}) translate(${pan.x / zoom}px, ${pan.y / zoom}px)`,
+            transformOrigin: 'center center',
+          }}
+        >
+          <img
+            ref={imageRef}
+            src={imageSrc}
+            alt="3D Digital Twin Preview"
+            className="max-w-[95%] max-h-[95%] w-auto h-auto object-contain rounded-lg md:rounded-xl shadow-2xl border-2 md:border-4 border-white select-none"
+            style={{ imageRendering: 'auto' }}
+            draggable={false}
+          />
+        </div>
       </div>
     </div>
   );

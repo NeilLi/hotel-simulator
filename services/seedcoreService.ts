@@ -90,6 +90,12 @@ export interface HotelTaskFacts {
   object_data?: Record<string, any>;
 }
 
+export interface GovernedFact {
+  subject: string;
+  predicate: string;
+  object_data: Record<string, any>;
+}
+
 export interface PKGEvaluateAsyncRequest {
   task_facts: HotelTaskFacts;
   snapshot_id?: number;
@@ -97,6 +103,9 @@ export interface PKGEvaluateAsyncRequest {
   embedding?: number[]; // 1024d embedding vector
   mode?: PKGMode; // Default: "advisory"
   zone_id?: string; // e.g., "magic_atelier", "journey_studio"
+  related_subjects?: string[]; // Additional subjects for multi-subject fact hydration (e.g., ["system:room_environment", "system:doors_management", "zone:DIRECTOR"])
+  signals?: Record<string, any>; // Actor/requestor context (e.g., { actor_subject, actor_role, actor_auth_level })
+  governed_facts?: GovernedFact[]; // Curated facts explicitly injected into evaluation (max 5-15, keep input <2KB)
 }
 
 export interface PKGEvaluateResponse {
@@ -114,7 +123,15 @@ export interface PKGEvaluateResponse {
     governed_facts?: any;
     semantic_context?: any;
   };
-  meta?: Record<string, any>;
+  meta?: {
+    duration_ms?: number;
+    engine?: 'wasm' | 'native';
+    rules_matched?: number;
+    subtasks_count?: number;
+    snapshot?: string;
+    had_semantic_context?: boolean;
+    [key: string]: any; // Allow additional meta fields
+  };
 }
 
 export interface MultimodalVoice {

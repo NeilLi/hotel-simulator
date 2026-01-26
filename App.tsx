@@ -1,13 +1,16 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Aperture, Map, Film, X, Activity, Clock, Power, Cpu, AlertTriangle, Layers, Terminal, Loader2, Thermometer, Wind, Lightbulb, Droplets, Sparkles, RefreshCw } from 'lucide-react';
+import { Aperture, Map, Film, X, Activity, Clock, Power, Cpu, AlertTriangle, Layers, Terminal, Loader2, Thermometer, Wind, Lightbulb, Droplets, Sparkles, RefreshCw, CheckCircle2, ShieldX, ShieldAlert } from 'lucide-react';
 import { geminiService } from './services/geminiService';
 import { generateMap, generateAgents, updateAgentsLogic } from './utils/simulationUtils';
-import { EntityType, Room, Agent, SeedCoreState, SeedCorePlane } from './types';
+import { EntityType, Room, Agent, SeedCoreState, SeedCorePlane, Snapshot } from './types';
 import { GRID_WIDTH, GRID_HEIGHT, TICK_RATE_MS } from './constants';
 import { DirectorMapLayer } from './components/DirectorMapLayer'; // Updated Import
 import { VirtualLobby } from './components/VirtualLobby';
 import { ConciergePanel } from './components/ConciergePanel';
 import { DIYEraLuxPortal } from './components/DIYEraLayer';
+import { seedcoreService, type PKGEvaluateResponse } from './services/seedcoreService';
+import { wearableStudioService } from './services/wearableStudioService';
+import { buildRoomSelectionPKGRequest, type RoomAccessContext } from './services/pkgRequests';
 
 // --- SIDEBAR COMPONENT: SENSORY TELEMETRY (LEFT) ---
 const SensoryTelemetryPanel = ({ active }: { active: boolean }) => {
@@ -71,6 +74,12 @@ const App: React.FC = () => {
   // Interaction State
   const [selectedRoom, setSelectedRoom] = useState<Room | null>(null);
   const [interactingAgentId, setInteractingAgentId] = useState<string | null>(null);
+  
+  // PKG Evaluation State
+  const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
+  const [pkgResponse, setPkgResponse] = useState<PKGEvaluateResponse | null>(null);
+  const [pkgLoading, setPkgLoading] = useState(false);
+  const [pkgError, setPkgError] = useState<string | null>(null);
 
   // Environment State
   const [isAdapting, setIsAdapting] = useState(false);
@@ -94,6 +103,58 @@ const App: React.FC = () => {
     setAgents(generateAgents(8, GRID_WIDTH, GRID_HEIGHT));
     setIsInitialized(true);
   }, []);
+
+  // Load active snapshot
+  useEffect(() => {
+    let alive = true;
+    wearableStudioService
+      .getActiveSnapshot()
+      .then((snap) => {
+        if (alive) setSnapshot(snap);
+      })
+      .catch(() => {
+        // silent; UI already handles snapshot unavailable
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  // Evaluate PKG when room is selected
+  useEffect(() => {
+    if (!selectedRoom) {
+      setPkgResponse(null);
+      setPkgError(null);
+      return;
+    }
+
+    setPkgLoading(true);
+    setPkgError(null);
+
+    const evaluateRoom = async () => {
+      try {
+        const pkgReq = buildRoomSelectionPKGRequest(selectedRoom, snapshot);
+        const response = await seedcoreService.evaluatePKGAsync(pkgReq);
+        setPkgResponse(response);
+      } catch (e: any) {
+        const msg = e?.message || String(e);
+        let userMessage = 'Failed to evaluate room access policy.';
+        
+        if (msg === 'PKG_NOT_AVAILABLE' || msg === 'SERVER_NOT_RUNNING' || msg === 'SERVER_NOT_INITIALIZED') {
+          userMessage = 'Policy evaluation system is unavailable.';
+        } else if (msg.includes('POLICY_BLOCKED')) {
+          userMessage = `Policy blocked: ${e?.ruleName || msg}`;
+        }
+        
+        setPkgError(userMessage);
+        setPkgResponse(null);
+      } finally {
+        setPkgLoading(false);
+      }
+    };
+
+    evaluateRoom();
+  }, [selectedRoom, snapshot]);
 
   const tick = useCallback(async () => {
     // Fix: Defensive check to prevent accessing property of undefined
@@ -236,7 +297,39 @@ const App: React.FC = () => {
                      <h3 className="text-sm font-bold uppercase tracking-[0.2em] text-white">{selectedRoom.name}</h3>
                      <span className="text-[8px] font-mono text-cyan-500/50 uppercase tracking-widest">Type: {selectedRoom.type} • ID: {selectedRoom.id}</span>
                    </div>
-                   <button onClick={() => setSelectedRoom(null)} className="p-2 hover:bg-white/10 rounded-full transition-all"><X size={16} className="text-slate-500" /></button>
+                   <div className="flex items-center gap-2">
+                     {/* PKG Evaluation Status */}
+                     {pkgLoading ? (
+                       <div className="px-3 py-1.5 rounded-full text-[10px] font-bold flex items-center gap-1.5 bg-indigo-100 text-indigo-700 border border-indigo-200">
+                         <Loader2 size={12} className="animate-spin" />
+                         Evaluating...
+                       </div>
+                     ) : pkgResponse ? (
+                       <div className={`px-3 py-1.5 rounded-full text-[10px] font-bold flex items-center gap-1.5 ${
+                         pkgResponse.decision?.allowed
+                           ? 'bg-emerald-100 text-emerald-700 border border-emerald-200'
+                           : 'bg-rose-100 text-rose-700 border border-rose-200'
+                       }`}>
+                         {pkgResponse.decision?.allowed ? (
+                           <>
+                             <CheckCircle2 size={12} />
+                             PKG: Allowed
+                           </>
+                         ) : (
+                           <>
+                             <ShieldX size={12} />
+                             PKG: Blocked
+                           </>
+                         )}
+                       </div>
+                     ) : pkgError ? (
+                       <div className="px-3 py-1.5 rounded-full text-[10px] font-bold flex items-center gap-1.5 bg-amber-100 text-amber-700 border border-amber-200">
+                         <ShieldAlert size={12} />
+                         Error
+                       </div>
+                     ) : null}
+                     <button onClick={() => setSelectedRoom(null)} className="p-2 hover:bg-white/10 rounded-full transition-all"><X size={16} className="text-slate-500" /></button>
+                   </div>
                 </div>
                 
                 <div className="grid grid-cols-2 gap-3 mb-6">
@@ -297,6 +390,152 @@ const App: React.FC = () => {
                 {envMetrics.narrative && (
                     <div className="mb-4 px-3 py-2 bg-emerald-500/10 border border-emerald-500/20 rounded-lg text-[9px] font-mono text-emerald-300 animate-in fade-in slide-in-from-bottom-2">
                         <span className="font-bold mr-2">SYS.LOG:</span> {envMetrics.narrative}
+                    </div>
+                )}
+
+                {/* PKG Evaluation Details - Enhanced */}
+                {pkgResponse && (
+                    <div className={`mb-4 rounded-lg text-[9px] font-mono animate-in fade-in slide-in-from-bottom-2 border overflow-hidden ${
+                      pkgResponse.decision?.allowed
+                        ? 'bg-emerald-500/10 border-emerald-500/20'
+                        : 'bg-rose-500/10 border-rose-500/20'
+                    }`}>
+                        {/* Header */}
+                        <div className="px-3 py-2 border-b border-white/10">
+                            <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-2">
+                                    {pkgResponse.decision?.allowed ? (
+                                        <CheckCircle2 size={12} className="text-emerald-400" />
+                                    ) : (
+                                        <ShieldX size={12} className="text-rose-400" />
+                                    )}
+                                    <span className={`font-bold uppercase ${pkgResponse.decision?.allowed ? 'text-emerald-300' : 'text-rose-300'}`}>
+                                        PKG Policy: {pkgResponse.decision?.allowed ? 'ALLOWED' : 'BLOCKED'}
+                                    </span>
+                                </div>
+                                {pkgResponse.meta && (
+                                    <div className="text-[8px] opacity-60 font-mono">
+                                        {(pkgResponse.meta as any).duration_ms && `${((pkgResponse.meta as any).duration_ms as number).toFixed(1)}ms`}
+                                        {(pkgResponse.meta as any).engine && ` • ${(pkgResponse.meta as any).engine.toUpperCase()}`}
+                                    </div>
+                                )}
+                            </div>
+                            {pkgResponse.decision?.reason && (
+                                <div className={`mt-2 text-[8px] ${pkgResponse.decision?.allowed ? 'text-emerald-200' : 'text-rose-200'} opacity-90`}>
+                                    {pkgResponse.decision.reason}
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Evaluation Metrics */}
+                        {(pkgResponse.meta || pkgResponse.provenance?.rules) && (
+                            <div className="px-3 py-2 bg-black/20 border-b border-white/5">
+                                <div className="grid grid-cols-2 gap-2 text-[8px]">
+                                    {(pkgResponse.meta as any)?.rules_matched !== undefined && (
+                                        <div className="flex items-center gap-1.5">
+                                            <span className="opacity-60">Rules Matched:</span>
+                                            <span className="font-bold text-cyan-300">{(pkgResponse.meta as any).rules_matched}</span>
+                                        </div>
+                                    )}
+                                    {pkgResponse.emissions?.subtasks && (
+                                        <div className="flex items-center gap-1.5">
+                                            <span className="opacity-60">Subtasks:</span>
+                                            <span className="font-bold text-cyan-300">{pkgResponse.emissions.subtasks.length}</span>
+                                        </div>
+                                    )}
+                                    {(pkgResponse.meta as any)?.snapshot && (
+                                        <div className="flex items-center gap-1.5 col-span-2">
+                                            <span className="opacity-60">Snapshot:</span>
+                                            <span className="font-mono text-[7px] text-cyan-400 truncate">{(pkgResponse.meta as any).snapshot}</span>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Matched Rules */}
+                        {pkgResponse.provenance?.rules && pkgResponse.provenance.rules.length > 0 && (
+                            <div className="px-3 py-2 border-b border-white/5">
+                                <div className="text-[8px] opacity-60 uppercase mb-1.5 font-bold">Matched Rules ({pkgResponse.provenance.rules.length}):</div>
+                                <div className="flex flex-wrap gap-1">
+                                    {pkgResponse.provenance.rules.map((rule: any, idx: number) => (
+                                        <span 
+                                            key={idx} 
+                                            className="px-2 py-0.5 bg-white/10 rounded text-[8px] font-mono border border-white/10 hover:bg-white/15 transition-colors"
+                                            title={rule.rule_id || rule.id || ''}
+                                        >
+                                            {rule.ruleName || rule.name || rule.rule_name || `Rule ${idx + 1}`}
+                                        </span>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Generated Subtasks/Emissions */}
+                        {pkgResponse.emissions?.subtasks && pkgResponse.emissions.subtasks.length > 0 && (
+                            <div className="px-3 py-2">
+                                <div className="text-[8px] opacity-60 uppercase mb-1.5 font-bold">Generated Subtasks ({pkgResponse.emissions.subtasks.length}):</div>
+                                <div className="space-y-1.5">
+                                    {pkgResponse.emissions.subtasks.map((subtask: any, idx: number) => (
+                                        <div 
+                                            key={idx} 
+                                            className="px-2 py-1.5 bg-white/5 rounded border border-white/10 text-[8px]"
+                                        >
+                                            <div className="flex items-start justify-between gap-2 mb-1">
+                                                <div className="flex items-center gap-1.5">
+                                                    <Sparkles size={10} className="text-cyan-400 flex-shrink-0" />
+                                                    <span className="font-bold text-cyan-300">
+                                                        {subtask.name || subtask.type || subtask.subtask_type || `Subtask ${idx + 1}`}
+                                                    </span>
+                                                </div>
+                                                {subtask.rule_name && (
+                                                    <span className="text-[7px] opacity-60 font-mono px-1 py-0.5 bg-white/5 rounded">
+                                                        {subtask.rule_name}
+                                                    </span>
+                                                )}
+                                            </div>
+                                            {subtask.params && Object.keys(subtask.params).length > 0 && (
+                                                <div className="mt-1 pl-3.5 text-[7px] opacity-70 font-mono">
+                                                    <div className="opacity-50 mb-0.5">Params:</div>
+                                                    {Object.entries(subtask.params).slice(0, 3).map(([key, value]: [string, any]) => (
+                                                        <div key={key} className="flex gap-1">
+                                                            <span className="opacity-60">{key}:</span>
+                                                            <span className="text-cyan-200">
+                                                                {typeof value === 'object' ? JSON.stringify(value).slice(0, 30) + '...' : String(value).slice(0, 40)}
+                                                            </span>
+                                                        </div>
+                                                    ))}
+                                                    {Object.keys(subtask.params).length > 3 && (
+                                                        <div className="opacity-50 text-[6px] mt-0.5">
+                                                            +{Object.keys(subtask.params).length - 3} more
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            )}
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Governed Facts Info */}
+                        {pkgResponse.provenance?.governed_facts && (
+                            <div className="px-3 py-2 bg-black/20 border-t border-white/5">
+                                <div className="text-[8px] opacity-60 uppercase mb-1">
+                                    Governed Facts: <span className="text-cyan-300 font-bold">
+                                        {Array.isArray(pkgResponse.provenance.governed_facts) 
+                                            ? pkgResponse.provenance.governed_facts.length 
+                                            : Object.keys(pkgResponse.provenance.governed_facts || {}).length}
+                                    </span>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                )}
+
+                {pkgError && (
+                    <div className="mb-4 px-3 py-2 bg-amber-500/10 border border-amber-500/20 rounded-lg text-[9px] font-mono text-amber-300 animate-in fade-in slide-in-from-bottom-2">
+                        <span className="font-bold mr-2">PKG ERROR:</span> {pkgError}
                     </div>
                 )}
 
