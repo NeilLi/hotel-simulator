@@ -465,7 +465,7 @@ export function DIYEraLuxPortal({
       { id: "JOURNEY", name: "Journey Studio", caption: "Direct Your Story", icon: Compass, theme: "royal" },
       { id: "GIFT", name: "Gift Forge", caption: "Craft 3D Objects", icon: Box, theme: "gold" },
       { id: "WEAR", name: "Fashion Lab", caption: "Design Wearables", icon: Shirt, theme: "blue" },
-      { id: "KIDS", name: "Magic Atelier", caption: "Kids Create", icon: Sparkles, theme: "rose", isKids: true },
+      { id: "KIDS", name: "Magic Atelier", caption: "Build Companions", icon: Sparkles, theme: "rose" },
     ],
     []
   );
@@ -594,8 +594,8 @@ export function DIYEraLuxPortal({
                                 {focusedZone.name}
                             </h2>
                             <p className="text-[15px] font-medium text-slate-500 leading-relaxed mb-10">
-                                {focusedZone.isKids 
-                                    ? "A safe, imaginative sandbox powered by Wonder-Tech™. Kids can build dreamscapes, spawn friendly creatures, and play in a protected creative zone."
+                                {focusedZone.id === "KIDS"
+                                    ? "Design and customize your perfect hotel companion. Create intelligent robot buddies with unique personalities, skills, and behaviors powered by Wonder-Tech™. Perfect for guests of all ages who want a personalized concierge experience."
                                     : `Step into the ${focusedZone.name} to start your project. Our AI assistants will help you iterate on designs, materials, and final production.`
                                 }
                             </p>

@@ -26,10 +26,10 @@ const TOY_TEMPLATES: Template[] = [
   { 
       id: 'DRONE_BUDDY', 
       name: 'Levitating Helper Bot', 
-      shortName: 'Bionic Cat',
+      shortName: 'Blue',
       desc: 'A friendly drone that follows you around.',
       icon: '🛸',
-      media: { type: "image", src: "/assets/cat.png" }
+      media: { type: "image", src: "/assets/blue.png" }
   },
   { 
       id: 'REACHY_MINI', 
@@ -38,7 +38,7 @@ const TOY_TEMPLATES: Template[] = [
       desc: 'A cute concierge buddy kit — build your own hotel companion.',
       icon: '🤖',
       badge: 'New • Hotel Edition',
-      media: { type: "gif", src: "/assets/reachy/reachy_mini_demo.gif" }
+      media: { type: "image", src: "/assets/reachy/mini.png" }
   }
 ];
 
@@ -79,7 +79,7 @@ const DEFAULT_BUDDY_CONFIGS: Record<string, BuddyIdentity> = {
     hotelSkills: { ...DEFAULT_SKILLS, wakeUpReminder: true },
   },
   DRONE_BUDDY: {
-    name: "Bionic Cat",
+    name: "Blue",
     role: "Guide",
     energy: 55,
     humor: 35,
@@ -196,7 +196,7 @@ export function MagicAtelier({ onBack }: Props) {
         signals: {
           risk_score: Math.min(wish.length / 1000, 1),
           content_category: "buddy_design",
-          age_rating: "kids",
+          age_rating: "all",
           region: "global",
           device: "router",
         },
@@ -424,6 +424,17 @@ export function MagicAtelier({ onBack }: Props) {
                            <div className="mb-5 rounded-2xl overflow-hidden border border-purple-200 shadow-sm">
                               <video
                                  src="/assets/dog.mp4"
+                                 autoPlay
+                                 loop
+                                 muted
+                                 playsInline
+                                 className="w-full h-52 object-cover"
+                              />
+                           </div>
+                        ) : selectedTemplate.id === "DRONE_BUDDY" ? (
+                           <div className="mb-5 rounded-2xl overflow-hidden border border-purple-200 shadow-sm">
+                              <video
+                                 src="/assets/blue.mp4"
                                  autoPlay
                                  loop
                                  muted
