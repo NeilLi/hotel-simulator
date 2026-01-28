@@ -139,6 +139,7 @@ export function MagicAtelier({ onBack }: Props) {
   // Active Mode State (Thought Trace)
   const [isActivating, setIsActivating] = useState(false);
   const [activationError, setActivationError] = useState<string | null>(null);
+  const [activationWarning, setActivationWarning] = useState<string | null>(null);
   const [routingLogs, setRoutingLogs] = useState<Array<{
     timestamp: string;
     level: 'info' | 'debug' | 'warning' | 'error';
@@ -322,11 +323,52 @@ export function MagicAtelier({ onBack }: Props) {
       createdAt: new Date().toISOString(),
     };
 
-    const savedBuddies = JSON.parse(localStorage.getItem('savedBuddies') || '[]');
-    savedBuddies.push(savedBuddy);
-    localStorage.setItem('savedBuddies', JSON.stringify(savedBuddies));
-    
-    alert(`Buddy "${buddyIdentity.name}" saved successfully!`);
+    try {
+      // Trim existing buddies BEFORE adding new one to prevent quota issues
+      const existingBuddies = JSON.parse(localStorage.getItem('savedBuddies') || '[]');
+      const MAX_SAVED_BUDDIES = 5; // Reduced to 5 to prevent quota issues with large image data
+      
+      // Sort by date and keep only most recent
+      const trimmedExisting = existingBuddies
+        .sort((a: SavedBuddy, b: SavedBuddy) => 
+          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+        )
+        .slice(0, MAX_SAVED_BUDDIES - 1); // Reserve space for new buddy
+      
+      // Add new buddy and save
+      const updatedBuddies = [savedBuddy, ...trimmedExisting];
+      localStorage.setItem('savedBuddies', JSON.stringify(updatedBuddies));
+      alert(`Buddy "${buddyIdentity.name}" saved successfully!`);
+    } catch (error) {
+      if (error instanceof Error && error.name === 'QuotaExceededError') {
+        // Aggressively clear storage and try again
+        try {
+          // Try to keep only the most recent 2 buddies
+          const savedBuddies = JSON.parse(localStorage.getItem('savedBuddies') || '[]');
+          const minimalBuddies = savedBuddies
+            .sort((a: SavedBuddy, b: SavedBuddy) => 
+              new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+            )
+            .slice(0, 1); // Keep only 1, then add new one
+          minimalBuddies.push(savedBuddy);
+          localStorage.setItem('savedBuddies', JSON.stringify(minimalBuddies));
+          alert(`Buddy "${buddyIdentity.name}" saved! (Cleared older buddies due to storage limit)`);
+        } catch (retryError) {
+          // Last resort: clear everything and try to save just this one
+          try {
+            localStorage.removeItem('savedBuddies');
+            localStorage.setItem('savedBuddies', JSON.stringify([savedBuddy]));
+            alert(`Buddy "${buddyIdentity.name}" saved! (Cleared all previous buddies due to storage limit)`);
+          } catch (finalError) {
+            alert(`Failed to save buddy: Storage quota exceeded. Please clear browser storage manually.`);
+            console.error('localStorage quota exceeded:', finalError);
+          }
+        }
+      } else {
+        alert(`Failed to save buddy: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        console.error('Error saving buddy:', error);
+      }
+    }
   };
 
   /**
@@ -680,6 +722,7 @@ Convert this wish into a SeedCore capability. If it's impossible or unsafe, expl
     
     setIsActivating(true);
     setActivationError(null);
+    setActivationWarning(null);
 
     try {
       // 1. Policy Gate check (using existing policy decision if available)
@@ -722,30 +765,151 @@ Convert this wish into a SeedCore capability. If it's impossible or unsafe, expl
         }
       }
 
-      // 2. Build SeedCore agent registration payload
+      // 2. Build SeedCore guest capability registration payload (Two-Layer Architecture)
+      // Generate or retrieve guest ID (use session-based UUID stored in localStorage)
+      let guestId = localStorage.getItem('hotel:guest_id');
+      
+      // Validate and regenerate if guest_id is not a valid UUID format
+      // This handles migration from old format (e.g., "guest:mkxwchuq_e1d154b") to UUID
+      const isValidUUID = (str: string): boolean => {
+        const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+        return uuidRegex.test(str);
+      };
+      
+      if (!guestId || !isValidUUID(guestId)) {
+        // Generate a proper UUID v4 for guest identification
+        // Format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
+        const generateUUID = () => {
+          return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+            const r = Math.random() * 16 | 0;
+            const v = c === 'x' ? r : (r & 0x3 | 0x8);
+            return v.toString(16);
+          });
+        };
+        guestId = generateUUID();
+        localStorage.setItem('hotel:guest_id', guestId);
+        
+        // Log migration for debugging
+        if (guestId && !isValidUUID(guestId)) {
+          console.log('Migrated invalid guest_id format to UUID:', guestId);
+        }
+      }
+      
       const agentId = `reachy_${buddyIdentity.name.toLowerCase().replace(/\s+/g, '_')}`;
       const behaviorConfig = mapPersonalityToBehaviorConfig();
       const defaultSkills = mapHotelSkillsToDefaultSkills();
 
-      // Include custom skills in the role profile
-      const customSkillDefinitions = buddyIdentity.customSkills?.map(skill => ({
-        skill_id: skill.id,
-        ...skill.seedcoreDefinition,
-      })) || [];
+      // Map behavior config to executor structure
+      const executorBehaviorConfig: any = {};
+      if (behaviorConfig.motion) {
+        executorBehaviorConfig.motion = behaviorConfig.motion;
+      }
+      if (behaviorConfig.llm) {
+        executorBehaviorConfig.llm = behaviorConfig.llm;
+      }
+      if (behaviorConfig.executor) {
+        executorBehaviorConfig.executor = behaviorConfig.executor;
+      }
+      if (behaviorConfig.cognitive) {
+        executorBehaviorConfig.cognitive = behaviorConfig.cognitive;
+      }
+      if (behaviorConfig.audio) {
+        executorBehaviorConfig.audio = behaviorConfig.audio;
+      }
+      if (behaviorConfig.safety_check) {
+        executorBehaviorConfig.safety_check = behaviorConfig.safety_check;
+      }
 
+      // Build behaviors list from behavior config
+      const behaviors: string[] = [];
+      if (behaviorConfig.executor?.behavior_config?.background_loop) {
+        behaviors.push('background_loop');
+      }
+      behaviors.push('proprioception_sync'); // Default behavior for Reachy Mini
+
+      // Build tools list from custom skills
+      const tools: string[] = [];
+      if (buddyIdentity.customSkills && buddyIdentity.customSkills.length > 0) {
+        buddyIdentity.customSkills.forEach(skill => {
+          if (skill.seedcoreDefinition?.allowed_tools && Array.isArray(skill.seedcoreDefinition.allowed_tools)) {
+            tools.push(...skill.seedcoreDefinition.allowed_tools);
+          }
+        });
+      }
+      // Add default Reachy tools (always include these)
+      const defaultTools = ['reachy.motion', 'reachy.gripper', 'reachy.head', 'reachy.arm_left', 'reachy.arm_right'];
+      defaultTools.forEach(tool => {
+        if (!tools.includes(tool)) {
+          tools.push(tool);
+        }
+      });
+
+      // Calculate valid_to date (30 days from now, or use a configurable duration)
+      const validToDate = new Date();
+      validToDate.setDate(validToDate.getDate() + 30); // 30 days validity
+      const validTo = validToDate.toISOString();
+
+      // Build guest capability registration payload (Two-Layer Architecture)
       const payload = {
-        agent_id: agentId,
-        specialization: "reachy_actuator",
-        role_profile: {
-          default_skills: defaultSkills,
-          behavior_config: behaviorConfig,
-          routing_tags: ["hotel_guest_room", buddyIdentity.role],
-          custom_skills: customSkillDefinitions, // Include AI-generated custom skills
+        guest_id: guestId,
+        persona_name: buddyIdentity.name,
+        base_capability_name: "reachy_actuator", // Base capability in system layer
+        executor: {
+          specialization: "reachy_actuator",
+          behaviors: behaviors,
+          behavior_config: executorBehaviorConfig,
+          tools: tools,
         },
+        routing: {
+          skills: defaultSkills,
+          routing_tags: ["hotel_guest_room", buddyIdentity.role, selectedTemplate.id],
+        },
+        valid_to: validTo, // Temporal validity for guest overlay
       };
 
-      // 3. Register the agent with SeedCore
-      const registrationResult = await seedcoreService.registerAgent(payload);
+      // 3. Try to register the capability with SeedCore (optional - proceed even if it fails)
+      let registrationResult = null;
+      let registrationWarning = null;
+      
+      try {
+        registrationResult = await seedcoreService.registerCapability(payload);
+      } catch (regError) {
+        // Registration is optional - if it fails, we'll still activate locally
+        console.warn('SeedCore registration failed (non-blocking):', regError);
+        
+        if (regError instanceof Error) {
+          // Check if it's a 404 (endpoint not found) - this is expected if backend doesn't support it yet
+          if (regError.message.includes('404') || regError.message.includes('Not Found')) {
+            registrationWarning = 'SeedCore backend endpoint not available. Companion activated locally.';
+          } else if (regError.message.includes('SERVER_NOT_RUNNING') || regError.message.includes('Failed to fetch')) {
+            registrationWarning = 'SeedCore backend not running. Companion activated locally.';
+          } else if (regError.message.includes('500') || regError.message.includes('transaction is aborted')) {
+            // Backend transaction error - likely a database issue
+            registrationWarning = 'SeedCore backend database error. Companion activated locally. The backend may need attention.';
+          } else if (regError.message.includes('422') || regError.message.includes('validation')) {
+            // Validation error - show more helpful message
+            registrationWarning = 'SeedCore registration validation error. Companion activated locally.';
+          } else {
+            // Extract a cleaner error message if possible
+            let errorMsg = regError.message;
+            // Try to extract JSON error detail if present
+            try {
+              const jsonMatch = regError.message.match(/\{.*\}/);
+              if (jsonMatch) {
+                const errorDetail = JSON.parse(jsonMatch[0]);
+                if (errorDetail.detail?.message) {
+                  errorMsg = errorDetail.detail.message.split('\n')[0]; // Get first line
+                }
+              }
+            } catch {
+              // Keep original message if parsing fails
+            }
+            registrationWarning = `SeedCore registration skipped: ${errorMsg}`;
+          }
+        } else {
+          registrationWarning = 'SeedCore registration skipped. Companion activated locally.';
+        }
+      }
       
       // 4. Save the active buddy configuration for use in hotel simulator
       const activeBuddy = {
@@ -756,28 +920,86 @@ Convert this wish into a SeedCore capability. If it's impossible or unsafe, expl
         agentId: agentId,
         activatedAt: new Date().toISOString(),
         seedcoreRegistration: registrationResult,
+        registrationWarning: registrationWarning || undefined,
       };
 
       // Store active buddy in localStorage for hotel simulator to access
-      localStorage.setItem('activeBuddy', JSON.stringify(activeBuddy));
+      try {
+        localStorage.setItem('activeBuddy', JSON.stringify(activeBuddy));
+      } catch (error) {
+        console.warn('Failed to save activeBuddy to localStorage:', error);
+        // Non-blocking - continue with activation
+      }
       
-      // Also add to saved buddies list
-      const savedBuddy: SavedBuddy = {
-        id: `buddy_${Date.now()}`,
-        identity: buddyIdentity,
-        wish: wish,
-        result: result,
-        createdAt: new Date().toISOString(),
-      };
-      const savedBuddies = JSON.parse(localStorage.getItem('savedBuddies') || '[]');
-      savedBuddies.push(savedBuddy);
-      localStorage.setItem('savedBuddies', JSON.stringify(savedBuddies));
+      // Also add to saved buddies list (with aggressive quota management)
+      // Note: This is non-blocking - activation succeeds even if history save fails
+      try {
+        // First, trim existing buddies BEFORE adding new one to prevent quota issues
+        const existingBuddies = JSON.parse(localStorage.getItem('savedBuddies') || '[]');
+        const MAX_SAVED_BUDDIES = 5; // Reduced to 5 to prevent quota issues with large image data
+        
+        // Sort by date and keep only most recent
+        const trimmedExisting = existingBuddies
+          .sort((a: SavedBuddy, b: SavedBuddy) => 
+            new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+          )
+          .slice(0, MAX_SAVED_BUDDIES - 1); // Reserve space for new buddy
+        
+        // Create a lightweight version of the buddy (strip large image data to save space)
+        const savedBuddy: SavedBuddy = {
+          id: `buddy_${Date.now()}`,
+          identity: buddyIdentity,
+          wish: wish,
+          result: {
+            ...result,
+            // Keep imageUrl but don't store base64 data if present
+            imageUrl: result.imageUrl, // Keep URL reference
+            // Remove any large base64 data that might be in the result
+          },
+          createdAt: new Date().toISOString(),
+        };
+        
+        // Add new buddy and save
+        const updatedBuddies = [savedBuddy, ...trimmedExisting];
+        localStorage.setItem('savedBuddies', JSON.stringify(updatedBuddies));
+      } catch (error) {
+        // Non-blocking - if saving to history fails, activation still succeeds
+        console.warn('Failed to save buddy to history (non-blocking):', error);
+        if (error instanceof Error && error.name === 'QuotaExceededError') {
+          // Aggressively clear storage
+          try {
+            // Try to keep only the most recent 2 buddies
+            const savedBuddies = JSON.parse(localStorage.getItem('savedBuddies') || '[]');
+            const minimalBuddies = savedBuddies
+              .sort((a: SavedBuddy, b: SavedBuddy) => 
+                new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+              )
+              .slice(0, 2);
+            localStorage.setItem('savedBuddies', JSON.stringify(minimalBuddies));
+          } catch (clearError) {
+            // If even clearing fails, remove the savedBuddies entirely
+            try {
+              localStorage.removeItem('savedBuddies');
+            } catch (removeError) {
+              console.error('Failed to clear savedBuddies:', removeError);
+            }
+          }
+        }
+      }
 
-      // 5. Set active agent ID and start polling logs
+      // 5. Set active agent ID and start polling logs (only if registration succeeded)
       setActiveAgentId(agentId);
-      setIsPollingLogs(true);
+      if (registrationResult) {
+        setIsPollingLogs(true);
+      }
       
-      // 6. Transition to ACTIVE_MODE
+      // 6. Show warning if registration failed, but don't block activation
+      if (registrationWarning) {
+        setActivationWarning(registrationWarning);
+        setActivationError(null); // Clear any previous errors
+      }
+      
+      // 7. Transition to ACTIVE_MODE (or REVEAL if we want to show the warning there)
       setStep('ACTIVE_MODE');
     } catch (error) {
       console.error('Error activating buddy:', error);
@@ -796,7 +1018,7 @@ Convert this wish into a SeedCore capability. If it's impossible or unsafe, expl
       
       setActivationError(errorMessage);
       
-      // Still save to localStorage even if SeedCore registration fails
+      // Still save to localStorage even if activation fails completely
       const activeBuddy = {
         id: `active_${Date.now()}`,
         templateId: selectedTemplate.id,
@@ -1557,6 +1779,12 @@ Convert this wish into a SeedCore capability. If it's impossible or unsafe, expl
                            <div className="text-sm text-rose-600">{activationError}</div>
                         </div>
                      )}
+                     {activationWarning && (
+                        <div className="mt-4 p-4 bg-amber-50 border border-amber-200 rounded-xl">
+                           <div className="text-xs font-bold text-amber-800 mb-1">Activation Notice</div>
+                           <div className="text-sm text-amber-700">{activationWarning}</div>
+                        </div>
+                     )}
 
                      <button 
                         onClick={handleReset}
@@ -1633,6 +1861,20 @@ Convert this wish into a SeedCore capability. If it's impossible or unsafe, expl
                            </span>
                         </div>
                      </div>
+
+                     {/* Warning/Error Display */}
+                     {activationWarning && (
+                        <div className="mb-6 p-4 bg-amber-50 border border-amber-200 rounded-xl">
+                           <div className="text-xs font-bold text-amber-800 mb-1">Activation Notice</div>
+                           <div className="text-sm text-amber-700">{activationWarning}</div>
+                        </div>
+                     )}
+                     {activationError && (
+                        <div className="mb-6 p-4 bg-rose-50 border border-rose-200 rounded-xl">
+                           <div className="text-xs font-bold text-rose-800 mb-1">Activation Error</div>
+                           <div className="text-sm text-rose-600">{activationError}</div>
+                        </div>
+                     )}
 
                      {/* Personality Configuration Display with SeedCore YAML Mappings */}
                      <div className="mb-6 grid grid-cols-1 md:grid-cols-4 gap-4">

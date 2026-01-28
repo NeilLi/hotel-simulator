@@ -1097,6 +1097,126 @@ class SeedCoreService {
   }
 
   /**
+   * Register a guest capability (Phase 1: Agent Materialization with Two-Layer Architecture)
+   * 
+   * This method registers a guest capability overlay in the guest_capabilities table,
+   * which serves as a temporal overlay on top of the immutable system layer (pkg_subtask_types).
+   * The CapabilityMonitor will detect the new entry and register it with the SpecializationManager.
+   * 
+   * Architecture:
+   * - System Layer (immutable): pkg_subtask_types contains base capabilities
+   * - Guest Layer (temporal): guest_capabilities contains guest-specific persona overrides
+   * - Resolution: Router checks guest_capabilities first, then falls back to pkg_subtask_types
+   * 
+   * @param options - Guest capability registration options
+   * @returns Registration result with capability name and status
+   * 
+   * @example
+   * ```typescript
+   * const result = await seedcoreService.registerCapability({
+   *   guest_id: "550e8400-e29b-41d4-a716-446655440000",
+   *   persona_name: "Mimi",
+   *   base_capability_name: "reachy_actuator",
+   *   executor: {
+   *     specialization: "reachy_actuator",
+   *     behaviors: ["background_loop", "proprioception_sync"],
+   *     behavior_config: {
+   *       motion: { velocity_multiplier: 0.85, smoothness: 0.80 },
+   *       llm: { temperature: 0.70 }
+   *     }
+   *   },
+   *   routing: {
+   *     skills: { roomService: 0.9 },
+   *     routing_tags: ["reachy_mini", "Concierge"]
+   *   },
+   *   valid_to: "2025-02-05T12:00:00Z"
+   * });
+   * ```
+   */
+  async registerCapability(options: {
+    guest_id: string;
+    persona_name: string;
+    base_capability_name: string;
+    executor?: {
+      specialization: string;
+      behaviors?: string[];
+      behavior_config?: {
+        motion?: {
+          velocity_multiplier?: number;
+          smoothness?: number;
+        };
+        llm?: {
+          temperature?: number;
+        };
+        executor?: {
+          behavior_config?: {
+            background_loop?: {
+              interval_s?: number;
+            };
+          };
+        };
+        cognitive?: {
+          llm_model_override?: string;
+        };
+        audio?: {
+          pitch?: number;
+        };
+        safety_check?: {
+          enabled?: boolean;
+        };
+      };
+      tools?: string[];
+    };
+    routing?: {
+      skills?: Record<string, number>;
+      routing_tags?: string[];
+    };
+    valid_to: string; // ISO8601 datetime string
+  }): Promise<{
+    name: string;
+    updated: boolean;
+    message: string;
+  }> {
+    try {
+      const response = await fetch(`${this.apiV1Base}/capabilities/register`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(options),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        let errorMessage = `Capability registration error (${response.status}): ${errorText}`;
+        
+        // Check for database constraint errors (server not initialized)
+        if (errorText.includes('snapshot_id') || errorText.includes('null value') || errorText.includes('violates not-null constraint')) {
+          errorMessage = 'SERVER_NOT_INITIALIZED';
+        }
+        
+        const error = new Error(errorMessage);
+        (error as any).status = response.status;
+        (error as any).originalMessage = errorText;
+        throw error;
+      }
+
+      return await response.json();
+    } catch (error) {
+      if (error instanceof Error) {
+        // Check if it's a network error (server not running)
+        if (error.message.includes('Failed to fetch') || error.message.includes('NetworkError') || error.message.includes('ECONNREFUSED')) {
+          const networkError = new Error('SERVER_NOT_RUNNING');
+          (networkError as any).originalError = error;
+          throw networkError;
+        }
+        throw error;
+      }
+      throw new Error(`Capability registration failed: ${String(error)}`);
+    }
+  }
+
+  /**
    * Get routing logs (thought trace) for an active agent
    * 
    * This method retrieves the real-time routing logs showing how the agent
