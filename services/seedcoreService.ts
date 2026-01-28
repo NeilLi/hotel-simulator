@@ -995,6 +995,172 @@ class SeedCoreService {
       throw new Error(`Unknown error reloading PKG: ${error}`);
     }
   }
+
+  // ------------------- Agent Registration -------------------
+
+  /**
+   * Register or update a SeedCore agent with personality configuration
+   * 
+   * This method initializes a specialized agent (e.g., Reachy Mini) with a role profile
+   * that includes personality traits, skills, and behavior configuration for VLA control.
+   * 
+   * @param options - Agent registration options
+   * @returns Registration result with agent ID and status
+   * 
+   * @example
+   * ```typescript
+   * const result = await seedcoreService.registerAgent({
+   *   agent_id: "reachy_mimi",
+   *   specialization: "reachy_actuator",
+   *   role_profile: {
+   *     default_skills: { roomService: 0.9, orderTowels: 0.8 },
+   *     behavior_config: {
+   *       personality: { energy: 0.65, warmth: 0.8, humor: 0.7 },
+   *       motion: { velocity_multiplier: 1.2, smoothness: 0.9 },
+   *       llm: { temperature: 0.8 },
+   *       audio: { pitch: 1.05 }
+   *     },
+   *     routing_tags: ["hotel_guest_room", "Concierge"]
+   *   }
+   * });
+   * ```
+   */
+  async registerAgent(options: {
+    agent_id: string;
+    specialization: string;
+    role_profile: {
+      default_skills?: Record<string, number | boolean>;
+      behavior_config?: {
+        personality?: {
+          energy?: number;
+          warmth?: number;
+          humor?: number;
+        };
+        motion?: {
+          velocity_multiplier?: number;
+          smoothness?: number;
+        };
+        llm?: {
+          temperature?: number;
+        };
+        audio?: {
+          pitch?: number;
+        };
+        safety_check?: {
+          enabled?: boolean;
+        };
+      };
+      routing_tags?: string[];
+    };
+  }): Promise<{
+    agent_id: string;
+    status: 'registered' | 'updated';
+    message: string;
+  }> {
+    try {
+      const response = await fetch(`${this.apiV1Base}/agents/register`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(options),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        let errorMessage = `Agent registration error (${response.status}): ${errorText}`;
+        
+        // Check for database constraint errors (server not initialized)
+        if (errorText.includes('snapshot_id') || errorText.includes('null value') || errorText.includes('violates not-null constraint')) {
+          errorMessage = 'SERVER_NOT_INITIALIZED';
+        }
+        
+        const error = new Error(errorMessage);
+        (error as any).status = response.status;
+        (error as any).originalMessage = errorText;
+        throw error;
+      }
+
+      return await response.json();
+    } catch (error) {
+      if (error instanceof Error) {
+        // Check if it's a network error (server not running)
+        if (error.message.includes('Failed to fetch') || error.message.includes('NetworkError') || error.message.includes('ECONNREFUSED')) {
+          const networkError = new Error('SERVER_NOT_RUNNING');
+          (networkError as any).originalError = error;
+          throw networkError;
+        }
+        throw error;
+      }
+      throw new Error(`Agent registration failed: ${String(error)}`);
+    }
+  }
+
+  /**
+   * Get routing logs (thought trace) for an active agent
+   * 
+   * This method retrieves the real-time routing logs showing how the agent
+   * processes requests, routes to different handlers, and executes actions.
+   * 
+   * @param agentId - The agent ID to get logs for
+   * @param limit - Maximum number of log entries to return (default: 50)
+   * @returns Array of routing log entries
+   * 
+   * @example
+   * ```typescript
+   * const logs = await seedcoreService.getAgentRoutingLogs("reachy_mimi", 20);
+   * console.log("Agent thought trace:", logs);
+   * ```
+   */
+  async getAgentRoutingLogs(
+    agentId: string,
+    limit: number = 50
+  ): Promise<Array<{
+    timestamp: string;
+    level: 'info' | 'debug' | 'warning' | 'error';
+    message: string;
+    context?: Record<string, any>;
+    routing_path?: string[];
+  }>> {
+    try {
+      const response = await fetch(`${this.apiV1Base}/agents/${agentId}/logs?limit=${limit}`, {
+        method: "GET",
+        headers: {
+          "Content-Type": "application/json",
+        },
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        // If agent doesn't exist or has no logs, return empty array
+        if (response.status === 404) {
+          return [];
+        }
+        
+        const error = new Error(`Failed to fetch routing logs (${response.status}): ${errorText}`);
+        (error as any).status = response.status;
+        throw error;
+      }
+
+      const data = await response.json();
+      return Array.isArray(data.logs) ? data.logs : [];
+    } catch (error) {
+      if (error instanceof Error) {
+        // Check if it's a network error (server not running)
+        if (error.message.includes('Failed to fetch') || error.message.includes('NetworkError') || error.message.includes('ECONNREFUSED')) {
+          const networkError = new Error('SERVER_NOT_RUNNING');
+          (networkError as any).originalError = error;
+          throw networkError;
+        }
+        // If agent not found, return empty array
+        if (error.message.includes('404')) {
+          return [];
+        }
+        throw error;
+      }
+      return [];
+    }
+  }
 }
 
 // Export singleton instance

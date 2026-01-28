@@ -7,7 +7,7 @@ import React, {
   ErrorInfo,
   ReactNode,
 } from "react";
-import { Canvas, useThree } from "@react-three/fiber";
+import { Canvas, useThree, useFrame } from "@react-three/fiber";
 import { MapControls, Html, Edges } from "@react-three/drei";
 import { EffectComposer, Bloom, Noise, Vignette } from "@react-three/postprocessing";
 import * as THREE from "three";
@@ -73,10 +73,13 @@ const STATUS_COLORS: Record<RoomStatus, string> = {
 };
 
 const THEME = {
-  bg: "#020617",
-  wall: "#1e293b",
+  bg: "#000000", // Matte black - Stealth & singularity
+  wall: "#2a3439", // Gunmetal base
   accent: "#22d3ee",
-  grid: "#0f172a",
+  grid: "#0a0a0a", // Near-black matte for grid base
+  gridLine: "#1a1a1a", // Subtle matte gray for grid lines
+  roomEdge: "#4a5a62", // Gunmetal for room edges/wireframes
+  roomEdgeSelected: "#6a7a82", // Lighter gunmetal for selected rooms
 };
 
 const COLORS = {
@@ -358,14 +361,19 @@ function FloorGrid() {
     <group rotation={[-Math.PI / 2, 0, 0]} position={[WORLD.center.x, -0.01, WORLD.center.z]}>
       <mesh receiveShadow>
         <planeGeometry args={[WORLD.width, WORLD.height]} />
-        <meshStandardMaterial color={THEME.grid} metalness={0.9} roughness={0.1} />
+        <meshStandardMaterial 
+          color={THEME.grid} 
+          metalness={0.95} 
+          roughness={0.15}
+          envMapIntensity={0.5}
+        />
       </mesh>
 
       <gridHelper
         args={[
           Math.max(WORLD.width, WORLD.height),
           Math.max(GRID_WIDTH, GRID_HEIGHT),
-          THEME.wall,
+          THEME.gridLine,
           THEME.grid,
         ]}
         rotation={[Math.PI / 2, 0, 0]}
@@ -420,6 +428,131 @@ const AgentMarker: React.FC<AgentMarkerProps> = ({ agent }) => {
   );
 };
 
+interface RoomLabelProps {
+  room: EnhancedRoom;
+  isSelected: boolean;
+  isHovered: boolean;
+  labelPosition: [number, number, number];
+  roomCenter: [number, number, number];
+}
+
+/**
+ * Optimized screen-space room label with distance-based LOD
+ */
+const RoomLabel: React.FC<RoomLabelProps> = ({ 
+  room, 
+  isSelected, 
+  isHovered,
+  labelPosition,
+  roomCenter 
+}) => {
+  const { camera } = useThree();
+  const [distance, setDistance] = useState(0);
+  const camPos = useRef(new THREE.Vector3());
+  const roomPos = useRef(new THREE.Vector3(...roomCenter));
+  
+  // Update distance every frame for smooth LOD transitions
+  useFrame(() => {
+    camera.getWorldPosition(camPos.current);
+    roomPos.current.set(...roomCenter);
+    const dist = camPos.current.distanceTo(roomPos.current);
+    setDistance(dist);
+  });
+
+  // Distance-based LOD: full name < 15, short < 30, hidden > 50
+  const labelContent = useMemo(() => {
+    if (isSelected || isHovered) return room.name; // Always show full name when focused
+    
+    // Special room types (LOBBY, GARDEN) always show full name when visible
+    if (room.type === "LOBBY" || room.type === "GARDEN") {
+      if (distance < 50) return room.name;
+      return null; // Hidden when far
+    }
+    
+    // Regular rooms with distance-based LOD
+    if (distance < 15) return room.name;
+    if (distance < 30) {
+      // Extract short identifier (e.g., "Suite 201A" -> "201A", "Room 101" -> "101")
+      const match = room.name.match(/(\d+[A-Z]?)$/i) || room.name.match(/([A-Z]\d+)/i);
+      return match ? match[1] : room.name.split(' ').pop() || room.name;
+    }
+    if (distance < 50) {
+      // Very short (just number)
+      const match = room.name.match(/(\d+)/);
+      return match ? match[1] : room.name.split(' ').pop() || room.name; // Fallback to last word if no number
+    }
+    return null; // Hidden when far
+  }, [distance, room.name, room.type, isSelected, isHovered]);
+
+  const shouldShow = labelContent !== null;
+  const isFocused = isSelected || isHovered;
+  
+  // Scale based on distance and focus state
+  const scale = useMemo(() => {
+    if (isFocused) return 1.2;
+    if (distance < 15) return 1.0;
+    if (distance < 30) return 0.9;
+    return 0.8;
+  }, [distance, isFocused]);
+
+  // Opacity based on distance
+  const opacity = useMemo(() => {
+    if (isFocused) return 1.0;
+    if (distance < 15) return 0.95;
+    if (distance < 30) return 0.85;
+    if (distance < 50) return 0.7;
+    return 0;
+  }, [distance, isFocused]);
+
+  if (!shouldShow) return null;
+
+  return (
+    <>
+      {/* Screen-space label with golden styling */}
+      <Html
+        position={labelPosition}
+        center
+        sprite
+        distanceFactor={50}
+        style={{
+          pointerEvents: 'none',
+          userSelect: 'none',
+          transform: `scale(${scale})`,
+          opacity,
+          transition: 'all 0.2s ease-out',
+        }}
+      >
+        <div
+          className="room-tag"
+          style={{
+            padding: isFocused ? '8px 14px' : '6px 12px',
+            borderRadius: '999px',
+            background: isFocused 
+              ? 'rgba(251, 191, 36, 0.15)' 
+              : 'rgba(10, 15, 20, 0.75)',
+            border: `1px solid ${isFocused ? 'rgba(251, 191, 36, 0.6)' : 'rgba(251, 191, 36, 0.35)'}`,
+            color: isFocused ? '#fbbf24' : '#fbbf24',
+            fontFamily: 'ui-sans-serif, system-ui, -apple-system, sans-serif',
+            fontWeight: 700,
+            fontSize: isFocused ? '14px' : '13px',
+            lineHeight: '1.1',
+            letterSpacing: '0.08em',
+            textTransform: 'uppercase',
+            boxShadow: isFocused
+              ? '0 8px 24px rgba(0,0,0,0.6), 0 0 0 1px rgba(251,191,36,0.2), 0 0 24px rgba(251,191,36,0.4)'
+              : '0 8px 24px rgba(0,0,0,0.45), 0 0 0 1px rgba(251,191,36,0.1), 0 0 18px rgba(251,191,36,0.2)',
+            backdropFilter: 'blur(6px)',
+            whiteSpace: 'nowrap',
+            textShadow: '0 1px 2px rgba(0,0,0,0.8)',
+          }}
+        >
+          {labelContent}
+        </div>
+      </Html>
+    </>
+  );
+};
+
 interface RoomModuleProps {
   room: EnhancedRoom;
   isSelected: boolean;
@@ -431,26 +564,29 @@ const RoomModule: React.FC<RoomModuleProps> = ({ room, isSelected, onClick }) =>
 
   const baseColor = STATUS_COLORS[room.status];
   const roomColor = room.type === "LOBBY" ? THEME.accent : baseColor;
+  // Use gunmetal as base for hard sci-fi aesthetic, status colors show through opacity
+  const roomBaseColor = THEME.wall;
   // SERVICE rooms are infrastructure - make them more transparent to avoid visual overlap
   const opacity = room.type === "SERVICE"
     ? (isSelected ? 0.25 : hovered ? 0.12 : 0.06)
     : (isSelected ? 0.45 : hovered ? 0.25 : 0.12);
 
   const [w, h, d] = room.dimensions;
+  const [x, y, z] = room.position;
 
   const doorPos = useMemo<[number, number, number]>(() => {
     // Door sits slightly outside the face
-    const y = -h / 2 + 0.6;
+    const doorY = -h / 2 + 0.6;
     switch (room.doorDirection) {
       case "N":
-        return [0, y, -d / 2 - 0.01];
+        return [0, doorY, -d / 2 - 0.01];
       case "S":
-        return [0, y, d / 2 + 0.01];
+        return [0, doorY, d / 2 + 0.01];
       case "E":
-        return [w / 2 + 0.01, y, 0];
+        return [w / 2 + 0.01, doorY, 0];
       case "W":
       default:
-        return [-w / 2 - 0.01, y, 0];
+        return [-w / 2 - 0.01, doorY, 0];
     }
   }, [room.doorDirection, w, h, d]);
 
@@ -458,6 +594,29 @@ const RoomModule: React.FC<RoomModuleProps> = ({ room, isSelected, onClick }) =>
     const needsYaw = room.doorDirection === "E" || room.doorDirection === "W";
     return [0, needsYaw ? Math.PI / 2 : 0, 0];
   }, [room.doorDirection]);
+
+  // Label position: above the room center, slightly offset based on door direction
+  const labelPosition = useMemo<[number, number, number]>(() => {
+    const labelY = h / 2 + 0.3; // Above the room
+    const offset = 0.15; // Small offset from center
+    
+    switch (room.doorDirection) {
+      case "N":
+        return [0, labelY, -offset];
+      case "S":
+        return [0, labelY, offset];
+      case "E":
+        return [offset, labelY, 0];
+      case "W":
+      default:
+        return [-offset, labelY, 0];
+    }
+  }, [room.doorDirection, h]);
+
+  // Room center in world space
+  const roomCenter = useMemo<[number, number, number]>(() => {
+    return [x, y + h / 2, z];
+  }, [x, y, z, h]);
 
   return (
     <group
@@ -476,55 +635,97 @@ const RoomModule: React.FC<RoomModuleProps> = ({ room, isSelected, onClick }) =>
       >
         <boxGeometry args={room.dimensions} />
         <meshStandardMaterial
-          color={roomColor}
+          color={roomBaseColor}
           transparent
-          opacity={opacity}
-          metalness={0.8}
-          roughness={0.2}
+          opacity={opacity * 0.6}
+          metalness={0.95}
+          roughness={0.15}
+          envMapIntensity={0.4}
           side={THREE.DoubleSide}
+          emissive={roomColor}
+          emissiveIntensity={isSelected ? 0.3 : hovered ? 0.15 : 0.1}
         />
-        <Edges color={isSelected ? "#ffffff" : roomColor} threshold={0.1} />
+        <Edges 
+          color={isSelected ? THEME.roomEdgeSelected : THEME.roomEdge} 
+          threshold={0.1} 
+        />
       </mesh>
 
-      {/* Door & Room Number - skip for GARDEN and SERVICE (service areas are infrastructure) */}
+      {/* Door - skip for GARDEN and SERVICE */}
       {room.type !== "GARDEN" && room.type !== "SERVICE" && (
         <group position={doorPos} rotation={doorRot}>
           <mesh>
             <planeGeometry args={[0.8, 1.2]} />
             <meshBasicMaterial color={roomColor} transparent opacity={0.65} side={THREE.DoubleSide} />
           </mesh>
-
-          <Html transform position={[0, 0.85, 0.02]} center distanceFactor={3}>
-            <div
-              className={`px-3 py-1.5 rounded text-base font-bold font-mono transition-all ${
-                isSelected
-                  ? "bg-white text-black"
-                  : "bg-slate-900/90 text-white border border-white/20"
-              }`}
-            >
-              {room.name}
-            </div>
-          </Html>
         </group>
       )}
-      
-      {/* Service areas get a label but no door */}
-      {room.type === "SERVICE" && (
-        <Html transform position={[0, 0.2, 0]} center distanceFactor={3}>
-          <div
-            className={`px-3 py-1.5 rounded text-sm font-bold font-mono transition-all ${
-              isSelected
-                ? "bg-white text-black"
-                : "bg-slate-900/90 text-white border border-white/20"
-            }`}
-          >
-            {room.name}
-          </div>
-        </Html>
+
+      {/* Optimized screen-space labels */}
+      {room.type !== "GARDEN" && (
+        <RoomLabel
+          room={room}
+          isSelected={isSelected}
+          isHovered={hovered}
+          labelPosition={labelPosition}
+          roomCenter={roomCenter}
+        />
       )}
 
+      {/* Enhanced spotlight when focused - same for all room types */}
       {(hovered || isSelected) && (
-        <pointLight position={[0, 0.2, 0]} color={roomColor} intensity={1.6} distance={6} />
+        <>
+          {/* Main overhead spotlight - brighter for selected */}
+          <pointLight 
+            position={[0, h + 2, 0]} 
+            color={roomColor} 
+            intensity={isSelected ? 3.5 : 2.5} 
+            distance={isSelected ? 12 : 10}
+            decay={2}
+            castShadow
+          />
+          {/* Ambient fill light from room center */}
+          <pointLight 
+            position={[0, h / 2, 0]} 
+            color={roomColor} 
+            intensity={isSelected ? 2.0 : 1.2} 
+            distance={isSelected ? 8 : 6}
+            decay={2.5}
+          />
+          {/* Edge accent lights - 4 corners for dramatic effect */}
+          {isSelected && (
+            <>
+              <pointLight 
+                position={[-w/2 + 0.5, h/2, -d/2 + 0.5]} 
+                color={roomColor} 
+                intensity={1.5} 
+                distance={5}
+                decay={3}
+              />
+              <pointLight 
+                position={[w/2 - 0.5, h/2, -d/2 + 0.5]} 
+                color={roomColor} 
+                intensity={1.5} 
+                distance={5}
+                decay={3}
+              />
+              <pointLight 
+                position={[-w/2 + 0.5, h/2, d/2 - 0.5]} 
+                color={roomColor} 
+                intensity={1.5} 
+                distance={5}
+                decay={3}
+              />
+              <pointLight 
+                position={[w/2 - 0.5, h/2, d/2 - 0.5]} 
+                color={roomColor} 
+                intensity={1.5} 
+                distance={5}
+                decay={3}
+              />
+            </>
+          )}
+        </>
       )}
     </group>
   );
@@ -645,9 +846,9 @@ function Scene({
               room={room}
               isSelected={selectedRoomId === room.id}
               onClick={() => {
-                // Only show reservation dialog for ROOM types
-                // Skip SERVICE (spine), LOBBY (atrium), and GARDEN (court)
-                if (room.type === "ROOM") {
+                // Allow selection for ROOM, LOBBY, and GARDEN types
+                // Skip SERVICE (spine) as it's infrastructure
+                if (room.type === "ROOM" || room.type === "LOBBY" || room.type === "GARDEN") {
                   // Pass formatted name upstream so the App-level popup shows the same label.
                   onRoomSelect({ ...room.originalRoom, name: room.name });
                 }
@@ -831,13 +1032,10 @@ export const DirectorMapLayer = ({
   }, [selectedFloor, enhancedRoomsFiltered]);
 
   return (
-    <div className="relative w-full h-full bg-slate-950 overflow-hidden">
+    <div className="relative w-full h-full bg-black overflow-hidden">
       {/* Floor Selector */}
-      <div className="absolute top-8 left-8 z-10 flex flex-col gap-2">
-        <h1 className="text-cyan-500 font-mono text-xs tracking-[0.2em] uppercase mb-4">
-          Floor Control
-        </h1>
-        {availableFloors.map((f) => {
+      <div className="absolute bottom-8 right-8 z-10 flex flex-col gap-2">
+        {availableFloors.slice().reverse().map((f) => {
           const count = floorIndex.get(f) ?? 0;
           const disabled = count === 0;
 
@@ -848,16 +1046,16 @@ export const DirectorMapLayer = ({
               onClick={() => setSelectedFloor(f)}
               className={`w-12 h-12 rounded-lg border font-mono transition-all relative ${
                 disabled
-                  ? "bg-slate-950/60 border-slate-800 text-slate-700 cursor-not-allowed"
+                  ? "bg-black/60 border-gray-800 text-gray-700 cursor-not-allowed"
                   : selectedFloor === f
                   ? "bg-cyan-500 border-cyan-400 text-white shadow-[0_0_15px_rgba(34,211,238,0.4)]"
-                  : "bg-slate-900 border-slate-700 text-slate-500 hover:border-cyan-500"
+                  : "bg-black/80 border-gray-700 text-gray-500 hover:border-cyan-500"
               }`}
               title={disabled ? "No rooms mapped to this floor" : `Rooms: ${count}`}
             >
               {f.toString().padStart(2, "0")}
               {!disabled && (
-                <span className="absolute -top-2 -right-2 text-[10px] px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-300">
+                <span className="absolute -top-2 -right-2 text-[10px] px-1.5 py-0.5 rounded bg-black/90 border border-gray-700 text-gray-300">
                   {count}
                 </span>
               )}
@@ -867,12 +1065,12 @@ export const DirectorMapLayer = ({
       </div>
 
       {/* Status Legend */}
-      <div className="absolute bottom-8 left-8 z-10 p-4 bg-slate-900/80 backdrop-blur-md border border-slate-700 rounded-xl">
+      <div className="absolute bottom-8 left-8 z-10 p-4 bg-black/80 backdrop-blur-md border border-gray-700 rounded-xl">
         <div className="grid grid-cols-2 gap-x-6 gap-y-2">
           {Object.entries(STATUS_COLORS).map(([status, color]) => (
             <div key={status} className="flex items-center gap-2">
               <div className="w-2 h-2 rounded-full" style={{ backgroundColor: color }} />
-              <span className="text-[10px] text-slate-400 font-mono uppercase tracking-wider">
+              <span className="text-[10px] text-gray-400 font-mono uppercase tracking-wider">
                 {status}
               </span>
             </div>
@@ -914,15 +1112,15 @@ export const DirectorMapLayer = ({
       {/* Empty Floor Overlay */}
       {!hasRoomsOnSelectedFloor && (
         <div className="absolute inset-0 z-10 pointer-events-none flex items-center justify-center">
-          <div className="px-5 py-4 rounded-2xl bg-slate-900/80 border border-slate-700 backdrop-blur-md text-center max-w-md">
+          <div className="px-5 py-4 rounded-2xl bg-black/80 border border-gray-700 backdrop-blur-md text-center max-w-md">
             <div className="text-cyan-400 font-mono text-xs tracking-widest uppercase mb-2">
               No rooms on Floor {selectedFloor.toString().padStart(2, "0")}
             </div>
-            <div className="text-slate-300 text-sm">
+            <div className="text-gray-300 text-sm">
               This usually means your room data doesn't include a usable floor field, or naming/IDs don't match the floor parser.
             </div>
-            <div className="text-slate-500 text-xs mt-2 font-mono">
-              Tip: include <span className="text-slate-300">room.floor</span> or <span className="text-slate-300">meta.floor</span>.
+            <div className="text-gray-500 text-xs mt-2 font-mono">
+              Tip: include <span className="text-gray-300">room.floor</span> or <span className="text-gray-300">meta.floor</span>.
             </div>
           </div>
         </div>
