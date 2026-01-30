@@ -156,6 +156,7 @@ export function MagicAtelier({ onBack }: Props) {
   }>>([]);
   const [isPollingLogs, setIsPollingLogs] = useState(false);
   const [activeAgentId, setActiveAgentId] = useState<string | null>(null);
+  const [birthTaskId, setBirthTaskId] = useState<string | null>(null); // Phase 2: Birth task ID for thought trace
   const [heartbeatLatency, setHeartbeatLatency] = useState<number | null>(null);
   const [safetyStatus, setSafetyStatus] = useState<'safe' | 'warning' | 'unsafe'>('safe');
 
@@ -292,8 +293,33 @@ export function MagicAtelier({ onBack }: Props) {
         `Skills: ${skillsList.join(", ") || "basic assistance"}. ` +
         `This buddy will greet guests during check-in, guide them in the hotel simulator, and help with DIY service requests. `;
 
-      // Proceed with toy design - buddy identity is now consistently included for all templates
-      const data = await geminiService.designToy(selectedTemplate.name, promptPrefix + wish);
+      // Generate blueprint based on buddy identity (no Gemini API call for image)
+      // Build accessory list from custom skills and features
+      const accessoryList: string[] = [];
+      if (buddyIdentity.customSkills && buddyIdentity.customSkills.length > 0) {
+        buddyIdentity.customSkills.forEach(skill => {
+          accessoryList.push(skill.name);
+        });
+      }
+      // Add default accessories based on role
+      if (buddyIdentity.role === "Concierge") {
+        accessoryList.push("Golden Bell Hat", "Polka-dot Bowtie", "Miniature Service Tray", "Star-shaped Nametag");
+      }
+
+      // Create blueprint from buddy identity (no Gemini API call)
+      const blueprintData = {
+        name: buddyIdentity.name,
+        personality: `${buddyIdentity.role} companion with ${buddyIdentity.energy > 70 ? 'high energy' : buddyIdentity.energy < 30 ? 'calm' : 'balanced'} personality. ${buddyIdentity.warmth > 70 ? 'Warm and sweet' : 'Professional'} with a ${buddyIdentity.humor > 70 ? 'playful' : 'respectful'} style.`,
+        superpower: `The Instant Sparkle ability, which makes any messy hotel room perfectly tidy and smelling like fresh cookies with a single happy beep!`,
+        assemblyInstructions: `Your ${buddyIdentity.name} is ready to assist! Say "${buddyIdentity.catchphrase}" to activate.`,
+        accessoryList: accessoryList.length > 0 ? accessoryList : [],
+      };
+
+      // Use static image instead of Gemini-generated image
+      const data: ToyDesignResult = {
+        imageUrl: "/assets/reveal_robot.png", // Static image path
+        blueprint: blueprintData,
+      };
       setResult(data);
       setStep('REVEAL');
     } catch (e) {
@@ -867,12 +893,80 @@ Convert this wish into a SeedCore capability. If it's impossible or unsafe, expl
         valid_to: validTo, // Temporal validity for guest overlay
       };
 
-      // 3. Try to register the capability with SeedCore (optional - proceed even if it fails)
+      // 3. Phase 1: Register the capability (Persona "DNA") with SeedCore
       let registrationResult = null;
       let registrationWarning = null;
+      let birthTaskId: string | null = null;
       
       try {
         registrationResult = await seedcoreService.registerCapability(payload);
+        
+        // 3b. Phase 2: Create the "Birth" task (materialize robot instance)
+        // This creates the task that triggers JIT spawning of the physical agent
+        // Task type: "action" (handled by QueueDispatcher, not GraphDispatcher)
+        // Task will be routed through CoordinatorHttpRouter -> OrganismRouter/CognitiveRouter
+        try {
+          const birthTask = await seedcoreService.createTask({
+            type: "action", // TaskType.ACTION - handled by QueueDispatcher
+            description: `Activate companion "${buddyIdentity.name}" (${buddyIdentity.role}) - Materialize robot instance`,
+            domain: "robot", // Domain for task routing (robot operations)
+            snapshot_id: snapshot?.id, // Include snapshot ID if available
+            params: {
+              // Interaction mode: coordinator_routed (not agent_tunnel) to use router
+              // This ensures task goes through QueueDispatcher -> CoordinatorHttpRouter
+              interaction: {
+                mode: "coordinator_routed", // Uses router, not direct agent tunnel
+              },
+              // Router inbox: tells router which agent/specialization to route to
+              // This is read-only input for the router (TaskPayload v2.5+)
+              routing: {
+                required_specialization: "reachy_actuator", // HARD constraint - must match
+                specialization: "reachy_actuator", // SOFT preference
+                skills: defaultSkills, // Skill scores (0.0-1.0) for routing/scoring
+                tools: tools, // Required tool names (RBAC + selection signals) - strings only
+                routing_tags: ["hotel_guest_room", buddyIdentity.role, selectedTemplate.id],
+                hints: {
+                  priority: 5, // Normal priority (0-10 scale)
+                  ttl_seconds: 300, // 5 minute TTL for activation task
+                },
+              },
+              // Cognitive envelope: controls inference style and model routing
+              // Populated after routing determines agent_id
+              cognitive: {
+                cog_type: "task_planning",
+                decision_kind: "planner",
+                skip_retrieval: false,
+                disable_memory_write: false,
+              },
+              // Tool calls: executable tool invocations (structured, not in routing.tools)
+              tool_calls: [
+                {
+                  name: "reachy.motion",
+                  args: {
+                    action: "initialize",
+                    persona: buddyIdentity.name,
+                    role: buddyIdentity.role,
+                  },
+                },
+              ],
+              // Metadata for tracking (custom envelope, not part of core spec)
+              meta: {
+                guest_id: guestId,
+                persona_name: buddyIdentity.name,
+                base_capability_name: "reachy_actuator",
+                activation_type: "companion_birth",
+              },
+            },
+            run_immediately: true, // Maps to run_after: NOW() on backend - triggers immediate processing
+          });
+          
+          birthTaskId = birthTask.id;
+          console.log('Birth task created:', birthTaskId);
+        } catch (birthError) {
+          // Birth task creation failure is non-blocking
+          console.warn('Failed to create birth task (non-blocking):', birthError);
+          // Don't set warning - capability registration succeeded, which is the critical part
+        }
       } catch (regError) {
         // Registration is optional - if it fails, we'll still activate locally
         console.warn('SeedCore registration failed (non-blocking):', regError);
@@ -920,6 +1014,7 @@ Convert this wish into a SeedCore capability. If it's impossible or unsafe, expl
         agentId: agentId,
         activatedAt: new Date().toISOString(),
         seedcoreRegistration: registrationResult,
+        birthTaskId: birthTaskId || undefined, // Phase 2: Birth task ID for thought trace
         registrationWarning: registrationWarning || undefined,
       };
 
@@ -987,9 +1082,12 @@ Convert this wish into a SeedCore capability. If it's impossible or unsafe, expl
         }
       }
 
-      // 5. Set active agent ID and start polling logs (only if registration succeeded)
+      // 5. Set active agent ID and birth task ID, start polling logs (only if registration succeeded)
       setActiveAgentId(agentId);
-      if (registrationResult) {
+      if (birthTaskId) {
+        setBirthTaskId(birthTaskId);
+      }
+      if (registrationResult || birthTaskId) {
         setIsPollingLogs(true);
       }
       
@@ -1033,74 +1131,85 @@ Convert this wish into a SeedCore capability. If it's impossible or unsafe, expl
     }
   };
 
-  // Poll routing logs and heartbeat when in ACTIVE_MODE
+  // Stream routing logs and heartbeat when in ACTIVE_MODE
   useEffect(() => {
-    if (!isPollingLogs || !activeAgentId || step !== 'ACTIVE_MODE') {
+    if (!isPollingLogs || step !== 'ACTIVE_MODE') {
       return;
     }
 
-    const pollLogs = async () => {
-      try {
-        const logs = await seedcoreService.getAgentRoutingLogs(activeAgentId, 50);
-        
-        // Enhance logs with SeedCore v2.5+ structure
-        const enhancedLogs = logs.map(log => {
-          // If log doesn't have routing_path but has context, infer from context
-          if (!log.routing_path && log.context) {
-            const inferredPath: string[] = [];
-            if (log.context.task_id) {
-              inferredPath.push('BRAIN_FOUNDRY');
-            }
-            if (log.context.decision) {
-              inferredPath.push('REACHY_CORE');
-            }
-            if (inferredPath.length > 0) {
-              log.routing_path = inferredPath;
-            }
-          }
-          return log;
-        });
-        
-        setRoutingLogs(enhancedLogs);
-      } catch (error) {
-        console.warn('Failed to fetch routing logs:', error);
-        
-        // If no logs exist yet and backend is not available, show sample logs for demo
-        if (routingLogs.length === 0 && error instanceof Error && error.message.includes('SERVER_NOT_RUNNING')) {
-          // Generate sample logs to demonstrate the Thought Trace structure
-          const sampleLogs: typeof routingLogs = [
-            {
-              timestamp: new Date().toISOString(),
-              level: 'info',
-              message: `VLA Inference: Person detected in '${buddyIdentity.warmth > 70 ? 'Sweet' : 'Neutral'}' posture.`,
-              routing_path: ['BRAIN_FOUNDRY', 'REACHY_CORE'],
-              context: {
-                router_score: 0.98,
-                decision: 'Executing wave_gesture',
-                vla_tokens: [104, 22, 19],
-                task_id: `task_${Date.now()}`,
-                routing_state: 'executing',
-              },
-            },
-            {
-              timestamp: new Date(Date.now() - 2000).toISOString(),
-              level: 'info',
-              message: 'Router/Coordinator: Routing to reachy_actuator specialization.',
-              routing_path: ['BRAIN_FOUNDRY'],
-              context: {
-                router_score: 0.95,
-                decision: 'route_to_executor',
-                task_id: `task_${Date.now() - 2000}`,
-                routing_state: 'routing',
-              },
-            },
-          ];
-          setRoutingLogs(sampleLogs);
-        }
-        // Don't show error to user, just silently fail or use sample logs
-      }
-    };
+    let closeStream: (() => void) | null = null;
+    let heartbeatInterval: NodeJS.Timeout | null = null;
 
+    // Phase 3: Stream task logs via SSE (Server-Sent Events)
+    if (birthTaskId) {
+      try {
+        // Stream logs from birth task using SSE
+        closeStream = seedcoreService.streamTaskLogs(
+          birthTaskId,
+          (log) => {
+            // Enhance log with SeedCore v2.5+ structure
+            const enhancedLog: typeof routingLogs[0] = {
+              timestamp: log.timestamp,
+              level: log.level,
+              message: log.message,
+              context: log.context,
+              routing_path: log.routing_path,
+            };
+
+            // If log doesn't have routing_path but has context, infer from context
+            if (!enhancedLog.routing_path && enhancedLog.context) {
+              const inferredPath: string[] = [];
+              if (enhancedLog.context.task_id) {
+                inferredPath.push('BRAIN_FOUNDRY');
+              }
+              if (enhancedLog.context.decision) {
+                inferredPath.push('REACHY_CORE');
+              }
+              if (inferredPath.length > 0) {
+                enhancedLog.routing_path = inferredPath;
+              }
+            }
+
+            // Append new log to existing logs (keep last 100 entries)
+            setRoutingLogs((prevLogs) => {
+              const updated = [...prevLogs, enhancedLog];
+              return updated.slice(-100); // Keep last 100 logs
+            });
+          },
+          (error) => {
+            console.warn('SSE stream error:', error);
+            // Don't fallback to agent logs - that endpoint doesn't exist
+            // SSE is the primary method, and if it fails, we'll just show empty logs
+            // The task logs endpoint should work, so this error is likely temporary
+          },
+          () => {
+            // Stream completed - task reached terminal state
+            console.log('Task log streaming completed');
+          },
+          1.0 // Poll interval: 1 second
+        );
+      } catch (sseError) {
+        console.warn('Failed to start SSE stream:', sseError);
+        // SSE is the primary method - if it fails, we'll show empty logs
+        // The task logs endpoint should work, so this error is likely temporary
+        // Don't fallback to agent logs endpoint (it doesn't exist - returns 404)
+      }
+    } else {
+      // No birth task ID - show message that logs will appear when task is created
+      // Don't try to poll agent logs (that endpoint doesn't exist)
+      if (routingLogs.length === 0) {
+        // Show a helpful message instead of trying to poll non-existent endpoint
+        setRoutingLogs([{
+          timestamp: new Date().toISOString(),
+          level: 'info',
+          message: 'Waiting for task creation... Logs will appear once the birth task is created.',
+          routing_path: [],
+          context: {},
+        }]);
+      }
+    }
+
+    // Poll heartbeat separately (simulated for now)
     const pollHeartbeat = async () => {
       try {
         const startTime = performance.now();
@@ -1123,19 +1232,19 @@ Convert this wish into a SeedCore capability. If it's impossible or unsafe, expl
       }
     };
 
-    // Initial fetch
-    pollLogs();
     pollHeartbeat();
+    heartbeatInterval = setInterval(pollHeartbeat, 1000);
 
-    // Poll logs every 2 seconds, heartbeat every 1 second
-    const logsInterval = setInterval(pollLogs, 2000);
-    const heartbeatInterval = setInterval(pollHeartbeat, 1000);
-
+    // Cleanup function
     return () => {
-      clearInterval(logsInterval);
-      clearInterval(heartbeatInterval);
+      if (closeStream) {
+        closeStream(); // Close SSE connection
+      }
+      if (heartbeatInterval) {
+        clearInterval(heartbeatInterval);
+      }
     };
-  }, [isPollingLogs, activeAgentId, step]);
+  }, [isPollingLogs, birthTaskId, activeAgentId, step, buddyIdentity]);
 
   const getRoleEmoji = (role: BuddyRole): string => {
     const emojis: Record<BuddyRole, string> = {
@@ -1644,12 +1753,10 @@ Convert this wish into a SeedCore capability. If it's impossible or unsafe, expl
                         </div>
                      </div>
 
-                     {/* Generated Image */}
-                     {result.imageUrl && (
-                        <div className="mb-6 rounded-2xl overflow-hidden border-2 border-purple-200 shadow-lg">
-                           <img src={result.imageUrl} alt={buddyIdentity.name} className="w-full h-64 object-cover" />
-                        </div>
-                     )}
+                     {/* Static Reveal Image */}
+                     <div className="mb-6 rounded-2xl overflow-hidden border-2 border-purple-200 shadow-lg">
+                        <img src="/assets/reveal_robot.png" alt={buddyIdentity.name} className="w-full h-64 object-cover" />
+                     </div>
 
                      {/* Identity Section */}
                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">

@@ -164,10 +164,11 @@ export interface MultimodalVision {
 
 export interface CreateTaskOptions {
   type: TaskType;
-  description: string;
-  params?: Record<string, any>;
-  domain?: string;
-  run_immediately?: boolean;
+  description?: string; // Optional, defaults to '' on backend
+  params?: Record<string, any>; // Optional, defaults to {} on backend
+  domain?: string; // Optional, Coordinator will infer if missing
+  run_immediately?: boolean; // Optional, defaults to true (sets status to QUEUED)
+  snapshot_id?: number; // Optional, explicit snapshot ID override
 }
 
 export interface TaskFilters {
@@ -342,13 +343,20 @@ class SeedCoreService {
    * Create a task
    */
   async createTask(options: CreateTaskOptions): Promise<Task> {
-    const payload = {
-      type: options.type,
-      description: options.description,
-      params: options.params || {},
-      run_immediately: options.run_immediately !== false, // default true
+    // Build payload matching backend API format
+    const payload: Record<string, any> = {
+      type: options.type, // Required (but backend defaults to 'unknown_task' if missing)
+      ...(options.description !== undefined && { description: options.description }),
+      ...(options.params !== undefined && { params: options.params }),
       ...(options.domain && { domain: options.domain }),
+      ...(options.run_immediately !== undefined && { run_immediately: options.run_immediately }),
+      ...(options.snapshot_id !== undefined && { snapshot_id: options.snapshot_id }),
     };
+
+    // Default run_immediately to true if not specified (sets status to QUEUED)
+    if (options.run_immediately === undefined) {
+      payload.run_immediately = true;
+    }
 
     return this.request<Task>("POST", "/tasks", payload);
   }
@@ -1217,6 +1225,170 @@ class SeedCoreService {
   }
 
   /**
+   * Stream task logs (thought trace) for a specific task via Server-Sent Events (SSE)
+   * 
+   * Phase 3: Streams the "Thought Trace" back to the React UI in real-time.
+   * This is the canonical way to get logs for a task instance.
+   * 
+   * @param taskId - The task ID to get logs for
+   * @param onLog - Callback function called for each log entry
+   * @param onError - Optional callback for errors
+   * @param onComplete - Optional callback when streaming completes
+   * @param pollInterval - Polling interval in seconds (default: 1.0)
+   * @returns Function to close the EventSource connection
+   * 
+   * @example
+   * ```typescript
+   * const close = seedcoreService.streamTaskLogs(
+   *   "task_123",
+   *   (log) => console.log("Log:", log),
+   *   (error) => console.error("Error:", error),
+   *   () => console.log("Complete")
+   * );
+   * // Later: close(); // Stop streaming
+   * ```
+   */
+  streamTaskLogs(
+    taskId: string,
+    onLog: (log: {
+      timestamp: string;
+      level: 'info' | 'debug' | 'warning' | 'error';
+      message: string;
+      context?: Record<string, any>;
+      routing_path?: string[];
+    }) => void,
+    onError?: (error: Error) => void,
+    onComplete?: () => void,
+    pollInterval: number = 1.0
+  ): () => void {
+    const url = `${this.apiV1Base}/tasks/${taskId}/logs?poll_interval=${pollInterval}`;
+    const eventSource = new EventSource(url);
+
+    eventSource.onopen = () => {
+      // Connection opened - wait for 'connected' event
+    };
+
+    eventSource.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        
+        // Handle different event types from SSE stream
+        switch (data.type) {
+          case 'connected':
+            // Initial connection established
+            break;
+          
+          case 'log':
+            // New log entry
+            if (data.log) {
+              onLog({
+                timestamp: data.log.timestamp || new Date().toISOString(),
+                level: data.log.level || 'info',
+                message: data.log.message || '',
+                context: data.log.context,
+                routing_path: data.log.routing_path,
+              });
+            }
+            break;
+          
+          case 'status':
+            // Task status update
+            if (data.status) {
+              onLog({
+                timestamp: new Date().toISOString(),
+                level: 'info',
+                message: `Task status: ${data.status}`,
+                context: { status: data.status },
+              });
+            }
+            break;
+          
+          case 'complete':
+            // Task completed - close connection
+            if (onComplete) {
+              onComplete();
+            }
+            eventSource.close();
+            break;
+          
+          case 'error':
+            // Error occurred
+            const error = new Error(data.message || 'Unknown error');
+            if (onError) {
+              onError(error);
+            }
+            eventSource.close();
+            break;
+          
+          default:
+            // Unknown event type - try to parse as log
+            if (data.timestamp || data.message) {
+              onLog({
+                timestamp: data.timestamp || new Date().toISOString(),
+                level: data.level || 'info',
+                message: data.message || JSON.stringify(data),
+                context: data.context,
+                routing_path: data.routing_path,
+              });
+            }
+        }
+      } catch (parseError) {
+        console.warn('Failed to parse SSE event:', parseError, event.data);
+        if (onError && parseError instanceof Error) {
+          onError(parseError);
+        }
+      }
+    };
+
+    eventSource.onerror = (error) => {
+      // EventSource error - connection lost or failed
+      // Don't immediately close - EventSource will auto-reconnect
+      // Only call onError if connection is truly dead (check readyState)
+      if (eventSource.readyState === EventSource.CLOSED) {
+        const err = new Error('SSE connection closed');
+        if (onError) {
+          onError(err);
+        }
+        eventSource.close();
+      }
+      // If readyState is CONNECTING or OPEN, EventSource will auto-reconnect
+      // Don't trigger error callback for temporary connection issues
+    };
+
+    // Return close function
+    return () => {
+      eventSource.close();
+    };
+  }
+
+  /**
+   * Get task logs (thought trace) for a specific task (legacy polling method)
+   * 
+   * @deprecated Use streamTaskLogs() for real-time streaming via SSE
+   * This method is kept for backward compatibility but will return empty array
+   * as the endpoint now uses SSE streaming.
+   * 
+   * @param taskId - The task ID to get logs for
+   * @param limit - Maximum number of log entries to return (default: 50)
+   * @returns Array of routing log entries (empty array - use streamTaskLogs instead)
+   */
+  async getTaskLogs(
+    taskId: string,
+    limit: number = 50
+  ): Promise<Array<{
+    timestamp: string;
+    level: 'info' | 'debug' | 'warning' | 'error';
+    message: string;
+    context?: Record<string, any>;
+    routing_path?: string[];
+  }>> {
+    // Legacy method - SSE endpoint doesn't support GET with limit
+    // Return empty array and log deprecation warning
+    console.warn('getTaskLogs() is deprecated. Use streamTaskLogs() for real-time SSE streaming.');
+    return [];
+  }
+
+  /**
    * Get routing logs (thought trace) for an active agent
    * 
    * This method retrieves the real-time routing logs showing how the agent
@@ -1285,3 +1457,26 @@ class SeedCoreService {
 
 // Export singleton instance
 export const seedcoreService = new SeedCoreService();
+
+// Re-export TaskPayload v2.5+ types and helpers for convenience
+export {
+  type TaskParamsV25,
+  type RouterInbox,
+  type RouterOutput,
+  type CognitiveEnvelope,
+  type ChatEnvelope,
+  type RiskEnvelope,
+  type GraphEnvelope,
+  type MultimodalEnvelope,
+  type ToolCall,
+  type InteractionEnvelope,
+  buildRouterInbox,
+  buildCognitiveEnvelope,
+  buildToolCalls,
+  buildMultimodalEnvelope,
+  buildTaskParamsV25,
+  validateRouterTools,
+  shouldBypassRouter,
+  getRequiredTools,
+  getToolCalls,
+} from './taskPayloadTypes';

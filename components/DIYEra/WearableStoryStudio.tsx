@@ -429,8 +429,37 @@ export function WearableStoryStudio({ onBack }: Props) {
         dispatch({ type: 'SET_ERROR', error: `Policy Refusal: ${pkgResponse?.decision?.reason || 'Safety criteria not met.'}` });
         dispatch({ type: 'SET_PREVIEW', show: false, pkgResponse: null });
         dispatch({ type: 'SET_STATUS', status: 'error' });
+        // Convert PKG response to PolicyDecision format and set it
+        const policyDecision: PolicyDecision = {
+          allowed: false,
+          blocked: true,
+          requiredOverrides: [],
+          reasons: [pkgResponse?.decision?.reason || 'Safety criteria not met.'],
+          ruleHits: pkgResponse?.provenance?.rules?.map((r: any) => ({
+            ruleId: r.rule_id || r.id || '',
+            ruleName: r.ruleName || r.name || r.rule_name || '',
+            priority: r.priority || 0,
+          })) || [],
+        };
+        dispatch({ type: 'SET_POLICY', decision: policyDecision });
         return;
       }
+
+      // Convert PKG response to PolicyDecision format and update state
+      // This ensures handleSubmit can check policyDecision when called from preview panel
+      const policyDecision: PolicyDecision = {
+        allowed: true,
+        blocked: false,
+        requiredOverrides: [],
+        reasons: [],
+        ruleHits: pkgResponse?.provenance?.rules?.map((r: any) => ({
+          ruleId: r.rule_id || r.id || '',
+          ruleName: r.ruleName || r.name || r.rule_name || '',
+          priority: r.priority || 0,
+        })) || [],
+      };
+      dispatch({ type: 'SET_POLICY', decision: policyDecision });
+      dispatch({ type: 'SET_ERROR', error: null }); // Clear any previous policy errors
 
       // 2) Find render emission
       // Handle both possible response structures: emissions.subtasks or result.subtasks
@@ -501,7 +530,15 @@ export function WearableStoryStudio({ onBack }: Props) {
       return;
     }
 
-    if (!state.policyDecision?.allowed) {
+    // Check policy decision - prefer previewPKGResponse if in preview mode, otherwise use policyDecision
+    const effectivePolicyDecision = state.previewPKGResponse?.decision 
+      ? {
+          allowed: state.previewPKGResponse.decision.allowed,
+          blocked: !state.previewPKGResponse.decision.allowed,
+        }
+      : state.policyDecision;
+
+    if (!effectivePolicyDecision?.allowed) {
       dispatch({ type: 'SET_ERROR', error: 'Policy evaluation required. Please wait for policy check to complete.' });
       return;
     }
@@ -542,63 +579,52 @@ export function WearableStoryStudio({ onBack }: Props) {
         createdAt: new Date().toISOString(),
       };
 
-      await wearableStudioService.submitTicket(ticket);
       dispatch({ type: 'SET_TICKET', ticket });
 
-      notify('Your design has been sent to production!', { ttlMs: 3500 });
+      // Evaluate PKG and create SeedCore tasks for manufacturing
+      const pkgReq = buildMfgPKGRequest(ticket, state.designDraft!, intent, snapshot);
+      const pkgRes = await seedcoreService.evaluatePKGAsync(pkgReq);
 
-      // Automated Emission Routing (non-blocking)
-      (async () => {
-        try {
-          const pkgReq = buildMfgPKGRequest(ticket, state.designDraft!, intent, snapshot);
-          const pkgRes = await seedcoreService.evaluatePKGAsync(pkgReq);
+      if (!pkgRes.decision.allowed) {
+        dispatch({ type: 'SET_STATUS', status: 'error' });
+        dispatch({ type: 'SET_ERROR', error: `Policy blocked manufacturing: ${pkgRes.decision.reason || 'Safety criteria not met.'}` });
+        notify(`Policy blocked manufacturing: ${pkgRes.decision.reason || 'blocked'}`, { isError: true, ttlMs: 9000 });
+        return;
+      }
 
-          if (!pkgRes.decision.allowed) {
-            notify(`Policy blocked manufacturing: ${pkgRes.decision.reason || 'blocked'}`, { isError: true, ttlMs: 9000 });
-            return;
-          }
+      // Create SeedCore task for manufacturing
+      const mfgTask = await seedcoreService.createTask({
+        type: 'action',
+        description: `Manufacture wearable: ${intent.type} - ${intent.style} style for ${intent.size}`,
+        domain: 'wearable_manufacturing',
+        snapshot_id: snapshot?.id,
+        params: {
+          ticket_id: ticket.ticketId,
+          run_id: ticket.runId,
+          intent: intent,
+          design: state.designDraft,
+          policy_decision: submitDecision,
+          snapshot_id: snapshot?.id,
+          snapshot_version: snapshot?.version,
+        },
+        run_immediately: true,
+      });
 
-          const createdTasks = await seedcoreService.executeEmissions(pkgRes.emissions, {
-            runImmediately: true,
-            domain: 'wearable_manufacturing',
-          });
+      // Execute emissions to create subtasks
+      const createdTasks = await seedcoreService.executeEmissions(pkgRes.emissions, {
+        runImmediately: true,
+        domain: 'wearable_manufacturing',
+      });
 
-          if (createdTasks.length > 0) {
-            const first = createdTasks[0];
-            notify(
-              `Your wearable is being prepared for manufacturing! ${createdTasks.length} task${createdTasks.length > 1 ? 's' : ''} created.`,
-              { taskId: String(first.task.id), ttlMs: 6000 }
-            );
-          } else {
-            notify('Your design has been sent to production!', { ttlMs: 3500 });
-          }
-        } catch (err: any) {
-          const emsg = err?.message || String(err);
-          const serverish =
-            emsg === 'SERVER_NOT_INITIALIZED' ||
-            emsg === 'SERVER_NOT_RUNNING' ||
-            emsg === 'PKG_NOT_AVAILABLE' ||
-            (typeof emsg === 'string' &&
-              (emsg.includes('snapshot_id') ||
-                emsg.includes('violates not-null constraint') ||
-                emsg.includes('Failed to fetch') ||
-                emsg.includes('ECONNREFUSED')));
-
-          if (serverish) {
-            notify('Server not initialized. Please ensure the database server is running and properly configured.', {
-              isError: true,
-              ttlMs: 9000,
-            });
-            return;
-          }
-          if (emsg.includes('POLICY_BLOCKED')) {
-            notify(`Policy blocked: ${err?.ruleName || emsg}`, { isError: true, ttlMs: 9000 });
-            return;
-          }
-          // Non-critical fallback
-          notify('Your design has been sent to production!', { ttlMs: 3500 });
-        }
-      })();
+      if (createdTasks.length > 0) {
+        const first = createdTasks[0];
+        notify(
+          `Your wearable is being prepared for manufacturing! ${createdTasks.length} task${createdTasks.length > 1 ? 's' : ''} created.`,
+          { taskId: String(first.task.id), ttlMs: 6000 }
+        );
+      } else {
+        notify('Your design has been sent to production!', { ttlMs: 3500 });
+      }
 
       dispatch({ type: 'SET_STATUS', status: 'done' });
 
@@ -715,7 +741,12 @@ export function WearableStoryStudio({ onBack }: Props) {
 
                   <div className="flex-shrink-0 mt-4">
                     <ActionsBar
-                      disabled={!state.previewSnapshot || isBusy || !state.designDraft}
+                      disabled={
+                        !state.previewSnapshot || 
+                        isBusy || 
+                        !state.designDraft ||
+                        !(state.previewPKGResponse?.decision?.allowed || state.policyDecision?.allowed)
+                      }
                       submitting={state.status === 'submitting'}
                       onSubmit={handleSubmit}
                     />
