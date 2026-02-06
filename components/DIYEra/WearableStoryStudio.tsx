@@ -525,6 +525,8 @@ export function WearableStoryStudio({ onBack }: Props) {
   }, [state.designDraft, state.runId, intent, snapshot]);
 
   const handleSubmit = useCallback(async () => {
+    console.error('[handleSubmit] 🔥 SEND TO MFG button clicked - handleSubmit called');
+    
     if (!state.designDraft) {
       dispatch({ type: 'SET_ERROR', error: 'No design draft available. Please generate a design first.' });
       return;
@@ -583,7 +585,52 @@ export function WearableStoryStudio({ onBack }: Props) {
 
       // Evaluate PKG and create SeedCore tasks for manufacturing
       const pkgReq = buildMfgPKGRequest(ticket, state.designDraft!, intent, snapshot);
+      console.error('[handleSubmit] 🔥 Calling evaluatePKGAsync for manufacturing');
       const pkgRes = await seedcoreService.evaluatePKGAsync(pkgReq);
+
+      // Log PKG response emissions BEFORE normalization
+      const checkForLegacyFormat = (obj: any, path: string = ''): string[] => {
+        const found: string[] = [];
+        if (obj === null || obj === undefined) return found;
+        if (typeof obj === 'string' && obj.includes('.')) {
+          const parts = obj.split('.');
+          if (parts.length === 2 && parts[0].length > 0 && parts[1].length > 0) {
+            found.push(`${path}: "${obj}"`);
+          }
+        } else if (Array.isArray(obj)) {
+          obj.forEach((item, idx) => {
+            found.push(...checkForLegacyFormat(item, `${path}[${idx}]`));
+          });
+        } else if (typeof obj === 'object') {
+          for (const [key, value] of Object.entries(obj)) {
+            found.push(...checkForLegacyFormat(value, path ? `${path}.${key}` : key));
+          }
+        }
+        return found;
+      };
+
+      const legacyFormats = checkForLegacyFormat(pkgRes.emissions, 'emissions');
+      if (legacyFormats.length > 0) {
+        console.error('[handleSubmit] ⚠️ LEGACY FORMAT DETECTED in PKG response:', legacyFormats);
+      }
+
+      console.error('[handleSubmit] 📦 PKG Response received (FULL STRUCTURE):', JSON.stringify({
+        decision: pkgRes.decision,
+        emissions: {
+          subtasks_count: pkgRes.emissions?.subtasks?.length || 0,
+          subtasks: pkgRes.emissions?.subtasks?.map((s: any) => ({
+            subtask_type: s.subtask_type || s.type,
+            specialization: s.specialization,
+            params: {
+              routing: s.params?.routing,
+              specialization: s.params?.specialization,
+              all_keys: s.params ? Object.keys(s.params) : [],
+            },
+            full_params: s.params, // Full params for inspection
+          })),
+        },
+        legacy_formats_found: legacyFormats,
+      }, null, 2));
 
       if (!pkgRes.decision.allowed) {
         dispatch({ type: 'SET_STATUS', status: 'error' });
@@ -592,7 +639,245 @@ export function WearableStoryStudio({ onBack }: Props) {
         return;
       }
 
+      // Normalize specialization fields in PKG emissions BEFORE passing to executeEmissions
+      // Converts "Manufacturing.Design" → specialization: "design", routing_tags: ["manufacturing"]
+      const normalizeSpecialization = (input: string): { spec: string; domain?: string } => {
+        if (!input || typeof input !== 'string') return { spec: input };
+        
+        // Check for legacy format with dot (e.g., "Manufacturing.Design")
+        if (input.includes('.')) {
+          const parts = input.split('.');
+          if (parts.length === 2 && parts[0].length > 0 && parts[1].length > 0) {
+            const domain = parts[0].toLowerCase();
+            const spec = parts[1].toLowerCase();
+            console.error(`[handleSubmit] 🔧 Split legacy format: "${input}" → specialization: "${spec}", domain: "${domain}"`);
+            return { spec, domain };
+          }
+          // Fallback: just replace dots with underscores
+          const normalized = input.toLowerCase().replace(/\./g, '_');
+          console.error(`[handleSubmit] 🔧 Normalized specialization: "${input}" → "${normalized}"`);
+          return { spec: normalized };
+        }
+        
+        return { spec: input.toLowerCase() };
+      };
+
+      const normalizeEmissions = (emissions: any, options?: { domain?: string }): any => {
+        if (!emissions) return emissions;
+        
+        const normalized = { ...emissions };
+        
+        // Filter out subtasks that should not be executed
+        const excludedSubtaskTypes = ['control_zone_access'];
+        
+        if (normalized.subtasks && Array.isArray(normalized.subtasks)) {
+          // Filter first, then normalize
+          normalized.subtasks = normalized.subtasks
+            .filter((subtask: any) => {
+              const subtaskType = subtask.subtask_type || subtask.type || subtask.name || '';
+              const shouldExclude = excludedSubtaskTypes.includes(subtaskType.toLowerCase());
+              if (shouldExclude) {
+                console.error(`[handleSubmit] ⏭️ Filtering out excluded subtask type: "${subtaskType}"`);
+              }
+              return !shouldExclude;
+            })
+            .map((subtask: any) => {
+            const normalizedSubtask = { ...subtask };
+            
+            // Ensure params.routing exists
+            if (!normalizedSubtask.params) {
+              normalizedSubtask.params = {};
+            }
+            if (!normalizedSubtask.params.routing) {
+              normalizedSubtask.params.routing = {};
+            }
+            
+            // Normalize routing.specialization (primary location)
+            if (normalizedSubtask.params.routing.specialization) {
+              const result = normalizeSpecialization(normalizedSubtask.params.routing.specialization);
+              normalizedSubtask.params.routing.specialization = result.spec;
+              
+              // Add domain to routing_tags if it was split from legacy format
+              if (result.domain) {
+                if (!normalizedSubtask.params.routing.routing_tags) {
+                  normalizedSubtask.params.routing.routing_tags = [];
+                }
+                if (!normalizedSubtask.params.routing.routing_tags.includes(result.domain)) {
+                  normalizedSubtask.params.routing.routing_tags.push(result.domain);
+                }
+              }
+            }
+            
+            // Normalize direct specialization field (migrate to routing)
+            if (normalizedSubtask.params.specialization) {
+              const result = normalizeSpecialization(normalizedSubtask.params.specialization);
+              // Set routing.specialization if not already set
+              if (!normalizedSubtask.params.routing.specialization) {
+                normalizedSubtask.params.routing.specialization = result.spec;
+              }
+              // Remove direct specialization field (migrated to routing)
+              delete normalizedSubtask.params.specialization;
+              
+              // Add domain to routing_tags if it was split
+              if (result.domain) {
+                if (!normalizedSubtask.params.routing.routing_tags) {
+                  normalizedSubtask.params.routing.routing_tags = [];
+                }
+                if (!normalizedSubtask.params.routing.routing_tags.includes(result.domain)) {
+                  normalizedSubtask.params.routing.routing_tags.push(result.domain);
+                }
+              }
+            }
+            
+            // Normalize top-level specialization field (migrate to routing)
+            if (normalizedSubtask.specialization) {
+              const result = normalizeSpecialization(normalizedSubtask.specialization);
+              // Set routing.specialization if not already set
+              if (!normalizedSubtask.params.routing.specialization) {
+                normalizedSubtask.params.routing.specialization = result.spec;
+              }
+              // Remove top-level specialization (migrated to routing)
+              delete normalizedSubtask.specialization;
+              
+              // Add domain to routing_tags if it was split
+              if (result.domain) {
+                if (!normalizedSubtask.params.routing.routing_tags) {
+                  normalizedSubtask.params.routing.routing_tags = [];
+                }
+                if (!normalizedSubtask.params.routing.routing_tags.includes(result.domain)) {
+                  normalizedSubtask.params.routing.routing_tags.push(result.domain);
+                }
+              }
+            }
+            
+            // Ensure routing_tags is an array (even if empty)
+            if (!normalizedSubtask.params.routing.routing_tags) {
+              normalizedSubtask.params.routing.routing_tags = [];
+            }
+            
+            // Set default specialization if missing (infer from subtask_type)
+            if (!normalizedSubtask.params.routing.specialization) {
+              const subtaskType = normalizedSubtask.subtask_type || normalizedSubtask.type || normalizedSubtask.name || '';
+              
+              // Map common subtask types to specializations
+              const specializationMap: Record<string, string> = {
+                'generate_precision_mockups': 'design',
+                'manufacture_wearable': 'manufacturing',
+                'design_wearable': 'design',
+                'print_placement': 'design',
+                'fabric_selection': 'design',
+              };
+              
+              // Try to infer from subtask_type name
+              let inferredSpecialization = specializationMap[subtaskType.toLowerCase()];
+              
+              // Fallback: extract from subtask_type if it contains known patterns
+              if (!inferredSpecialization) {
+                if (subtaskType.toLowerCase().includes('design') || 
+                    subtaskType.toLowerCase().includes('mockup') ||
+                    subtaskType.toLowerCase().includes('render')) {
+                  inferredSpecialization = 'design';
+                } else if (subtaskType.toLowerCase().includes('manufacture') ||
+                          subtaskType.toLowerCase().includes('mfg') ||
+                          subtaskType.toLowerCase().includes('production')) {
+                  inferredSpecialization = 'manufacturing';
+                }
+              }
+              
+              if (inferredSpecialization) {
+                normalizedSubtask.params.routing.specialization = inferredSpecialization;
+                
+                // Set required_specialization for critical subtask types
+                const requiresHardConstraint = ['generate_precision_mockups'];
+                if (requiresHardConstraint.includes(subtaskType.toLowerCase())) {
+                  normalizedSubtask.params.routing.required_specialization = inferredSpecialization;
+                  console.error(`[handleSubmit] 🔧 Set required_specialization "${inferredSpecialization}" for subtask "${subtaskType}"`);
+                } else {
+                  console.error(`[handleSubmit] 🔧 Set default specialization "${inferredSpecialization}" for subtask "${subtaskType}"`);
+                }
+                
+                // Add "manufacturing" to routing_tags if this is a manufacturing domain task
+                if (inferredSpecialization === 'design' && options && options.domain === 'wearable_manufacturing') {
+                  if (!normalizedSubtask.params.routing.routing_tags.includes('manufacturing')) {
+                    normalizedSubtask.params.routing.routing_tags.push('manufacturing');
+                  }
+                }
+              } else {
+                console.error(`[handleSubmit] ⚠️ Could not infer specialization for subtask "${subtaskType}"`);
+              }
+            } else {
+              // Specialization exists - set required_specialization for critical subtask types
+              const subtaskType = normalizedSubtask.subtask_type || normalizedSubtask.type || normalizedSubtask.name || '';
+              const requiresHardConstraint = ['generate_precision_mockups'];
+              if (requiresHardConstraint.includes(subtaskType.toLowerCase())) {
+                normalizedSubtask.params.routing.required_specialization = normalizedSubtask.params.routing.specialization;
+                console.error(`[handleSubmit] 🔧 Set required_specialization "${normalizedSubtask.params.routing.specialization}" for subtask "${subtaskType}"`);
+              }
+              
+              // Ensure routing_tags includes "manufacturing" for manufacturing domain
+              if (normalizedSubtask.params.routing.specialization === 'design' && options && options.domain === 'wearable_manufacturing') {
+                if (!normalizedSubtask.params.routing.routing_tags.includes('manufacturing')) {
+                  normalizedSubtask.params.routing.routing_tags.push('manufacturing');
+                }
+              }
+            }
+            
+            return normalizedSubtask;
+          });
+        }
+        
+        return normalized;
+      };
+
+      const normalizedEmissions = normalizeEmissions(pkgRes.emissions, { domain: 'wearable_manufacturing' });
+      
+      // Log normalized emissions
+      console.error('[handleSubmit] ✅ Normalized emissions (FULL STRUCTURE):', JSON.stringify({
+        subtasks_count: normalizedEmissions?.subtasks?.length || 0,
+        subtasks: normalizedEmissions?.subtasks?.map((s: any) => ({
+          subtask_type: s.subtask_type || s.type,
+          specialization: s.specialization,
+          params: {
+            routing: {
+              specialization: s.params?.routing?.specialization,
+              required_specialization: s.params?.routing?.required_specialization,
+              routing_tags: s.params?.routing?.routing_tags,
+            },
+            specialization: s.params?.specialization,
+            all_keys: s.params ? Object.keys(s.params) : [],
+          },
+          full_params: s.params, // Full params for inspection
+        })),
+      }, null, 2));
+
       // Create SeedCore task for manufacturing
+      console.error('[handleSubmit] 🔥 Calling createTask for manufacturing');
+      
+      // Transform intent to match expected structure
+      const transformedIntent = {
+        goal: 'manufacture_wearable',
+        product: intent.type.toLowerCase().replace(/\s+/g, '_'), // "T-Shirt" -> "tshirt"
+        size: intent.size,
+        style: intent.style.toLowerCase(),
+        persona: intent.persona || 'guest',
+        constraints: intent.constraints || [],
+      };
+      
+      // Add PKG decomposition policy structure
+      const pkgStructure = {
+        decomposition_policy: 'manufacturing_standard_v1',
+        allowed_phases: [
+          'design',
+          'material_procurement',
+          'production',
+          'quality_control',
+        ],
+        required_outputs: [
+          'final_mockup',
+          'manufacturing_ready_pattern',
+        ],
+      };
+      
       const mfgTask = await seedcoreService.createTask({
         type: 'action',
         description: `Manufacture wearable: ${intent.type} - ${intent.style} style for ${intent.size}`,
@@ -601,7 +886,8 @@ export function WearableStoryStudio({ onBack }: Props) {
         params: {
           ticket_id: ticket.ticketId,
           run_id: ticket.runId,
-          intent: intent,
+          intent: transformedIntent,
+          pkg: pkgStructure,
           design: state.designDraft,
           policy_decision: submitDecision,
           snapshot_id: snapshot?.id,
@@ -610,8 +896,9 @@ export function WearableStoryStudio({ onBack }: Props) {
         run_immediately: true,
       });
 
-      // Execute emissions to create subtasks
-      const createdTasks = await seedcoreService.executeEmissions(pkgRes.emissions, {
+      // Execute emissions to create subtasks (using normalized emissions)
+      console.error('[handleSubmit] 🔥 Calling executeEmissions with normalized emissions');
+      const createdTasks = await seedcoreService.executeEmissions(normalizedEmissions, {
         runImmediately: true,
         domain: 'wearable_manufacturing',
       });

@@ -212,6 +212,28 @@ class SeedCoreService {
   }
 
   /**
+   * Normalize specialization string from legacy format to canonical format
+   * 
+   * Converts "Manufacturing.Design" → "manufacturing_design"
+   * This ensures compatibility with router registration and prevents fallback to default handlers.
+   * 
+   * @param input - Specialization string (may be legacy format with dots)
+   * @returns Normalized specialization string (lowercase, underscores instead of dots)
+   */
+  private normalizeSpecialization(input: string): string {
+    if (!input || typeof input !== 'string') return input;
+
+    // Manufacturing.Design → manufacturing_design
+    if (input.includes('.')) {
+      const normalized = input.toLowerCase().replace(/\./g, '_');
+      console.log(`[normalizeSpecialization] "${input}" → "${normalized}"`);
+      return normalized;
+    }
+
+    return input.toLowerCase();
+  }
+
+  /**
    * Parse time string like "1h", "24h", "2d", "30m", or ISO date "YYYY-MM-DD"
    */
   private parseSince(val: string): Date | null {
@@ -271,6 +293,25 @@ class SeedCoreService {
     };
 
     if (body) {
+      // Log task creation payloads to debug specialization issues
+      if (endpoint === '/tasks' && method === 'POST') {
+        const specializationInfo: Record<string, any> = {};
+        if (body.params?.routing?.specialization) {
+          specializationInfo.routing_specialization = body.params.routing.specialization;
+        }
+        if (body.params?.specialization) {
+          specializationInfo.specialization = body.params.specialization;
+        }
+        if (Object.keys(specializationInfo).length > 0) {
+          console.log('[request] Sending task to API with specialization:', JSON.stringify(specializationInfo, null, 2));
+          // Also check for legacy format in the actual body being sent
+          const bodyStr = JSON.stringify(body);
+          if (bodyStr.includes('Manufacturing.Design') || bodyStr.includes('manufacturing.design')) {
+            console.error('[request] ⚠️ LEGACY FORMAT DETECTED IN REQUEST BODY!');
+            console.error('[request] Body contains legacy format:', bodyStr.substring(0, 500));
+          }
+        }
+      }
       options.body = JSON.stringify(body);
     }
 
@@ -357,6 +398,84 @@ class SeedCoreService {
     if (options.run_immediately === undefined) {
       payload.run_immediately = true;
     }
+
+    // Log specialization values BEFORE normalization for debugging
+    const beforeNormalization = {
+      routing_specialization: payload.params?.routing?.specialization,
+      specialization: payload.params?.specialization,
+    };
+    if (beforeNormalization.routing_specialization || beforeNormalization.specialization) {
+      console.log('[createTask] BEFORE normalization:', JSON.stringify(beforeNormalization, null, 2));
+    }
+
+    // Recursively normalize all specialization fields in params
+    const normalizeSpecializationsInObject = (obj: any, path: string = 'payload.params'): void => {
+      if (obj === null || obj === undefined) return;
+      
+      if (typeof obj === 'object' && !Array.isArray(obj)) {
+        for (const [key, value] of Object.entries(obj)) {
+          // Skip _emission to preserve provenance data
+          if (key === '_emission') continue;
+          
+          // Normalize specialization fields
+          if (key === 'specialization' && typeof value === 'string') {
+            const original = value;
+            const normalized = this.normalizeSpecialization(value);
+            if (original !== normalized) {
+              console.log(`[createTask] Normalized ${path}.${key}: "${original}" → "${normalized}"`);
+              obj[key] = normalized;
+            }
+          }
+          
+          // Recursively check nested objects
+          if (typeof value === 'object' && value !== null) {
+            normalizeSpecializationsInObject(value, `${path}.${key}`);
+          }
+        }
+      }
+    };
+
+    // Enforce normalization at the boundary - prevent legacy strings from crossing API boundary
+    normalizeSpecializationsInObject(payload.params);
+
+    // Log final payload specialization values AFTER normalization
+    const afterNormalization = {
+      routing_specialization: payload.params?.routing?.specialization,
+      specialization: payload.params?.specialization,
+    };
+    if (afterNormalization.routing_specialization || afterNormalization.specialization) {
+      console.log('[createTask] AFTER normalization (sending to API):', JSON.stringify(afterNormalization, null, 2));
+      // Also log full routing object to catch any nested issues
+      if (payload.params?.routing) {
+        console.log('[createTask] Full routing object:', JSON.stringify(payload.params.routing, null, 2));
+      }
+    }
+
+    // Deep check for any remaining legacy format in params (defensive)
+    const checkForLegacyInObject = (obj: any, path: string = 'payload.params'): void => {
+      if (obj === null || obj === undefined) return;
+      if (typeof obj === 'string') {
+        if (obj.includes('.') && obj.split('.').length === 2) {
+          const parts = obj.split('.');
+          if (parts[0].length > 0 && parts[1].length > 0) {
+            console.error(`[createTask] ⚠️ LEGACY FORMAT STILL PRESENT at ${path}: "${obj}"`);
+          }
+        }
+        return;
+      }
+      if (Array.isArray(obj)) {
+        obj.forEach((item, idx) => checkForLegacyInObject(item, `${path}[${idx}]`));
+        return;
+      }
+      if (typeof obj === 'object') {
+        for (const [key, value] of Object.entries(obj)) {
+          // Skip _emission to avoid false positives on provenance data
+          if (key === '_emission') continue;
+          checkForLegacyInObject(value, `${path}.${key}`);
+        }
+      }
+    };
+    checkForLegacyInObject(payload.params);
 
     return this.request<Task>("POST", "/tasks", payload);
   }
@@ -831,16 +950,134 @@ class SeedCoreService {
       domain?: string;
     }
   ): Promise<Array<{ task: Task; emission: any }>> {
+    console.error('[executeEmissions] 🔥 Called with emissions:', JSON.stringify({
+      subtasks_count: emissions?.subtasks?.length || 0,
+      subtasks: emissions?.subtasks?.map((s: any) => ({
+        subtask_type: s.subtask_type || s.type,
+        specialization: s.specialization,
+        params_routing_specialization: s.params?.routing?.specialization,
+        params_specialization: s.params?.specialization,
+        params_keys: s.params ? Object.keys(s.params) : [],
+      })),
+    }, null, 2));
+    
     const { subtasks = [] } = emissions;
     const results: Array<{ task: Task; emission: any }> = [];
 
+    // Filter out subtasks that should not be executed as SeedCore tasks
+    const excludedSubtaskTypes = ['control_zone_access'];
+    const filteredSubtasks = subtasks.filter((emission: any) => {
+      const subtaskType = emission.subtask_type || emission.type || emission.name || '';
+      const shouldExclude = excludedSubtaskTypes.includes(subtaskType.toLowerCase());
+      if (shouldExclude) {
+        console.error(`[executeEmissions] ⏭️ Skipping excluded subtask type: "${subtaskType}"`);
+      }
+      return !shouldExclude;
+    });
+
     // Execute each subtask emission as a SeedCore task
-    for (const emission of subtasks) {
+    for (const emission of filteredSubtasks) {
       try {
         // Extract task type and description from emission
         const subtaskType = emission.subtask_type || emission.type || "action";
         const description = emission.description || emission.name || JSON.stringify(emission.params || {});
-        const params = emission.params || {};
+        // Create a deep copy of params to ensure modifications are preserved
+        // Handle edge cases: null, undefined, or non-serializable values
+        let params: Record<string, any> = {};
+        try {
+          if (emission.params) {
+            params = JSON.parse(JSON.stringify(emission.params));
+          }
+        } catch (e) {
+          // Fallback to shallow copy if deep copy fails (e.g., circular references)
+          console.warn('[executeEmissions] Failed to deep copy params, using shallow copy:', e);
+          params = { ...emission.params };
+        }
+
+        // Ensure routing structure exists and is properly formatted
+        if (!params.routing) {
+          params.routing = {};
+        }
+        if (!Array.isArray(params.routing.routing_tags)) {
+          params.routing.routing_tags = params.routing.routing_tags ? [params.routing.routing_tags] : [];
+        }
+
+        // Fail fast if legacy specialization format is detected
+        // Normalization should happen upstream - if we see legacy format here, it's a bug
+        const checkForLegacyFormat = (value: any, path: string): void => {
+          if (typeof value === 'string' && value.includes('.')) {
+            // Check if it looks like a legacy specialization format (e.g., "Manufacturing.Design")
+            const parts = value.split('.');
+            if (parts.length === 2 && parts[0].length > 0 && parts[1].length > 0) {
+              throw new Error(
+                `Legacy specialization format detected at "${path}": "${value}". ` +
+                `Expected canonical format (e.g., "design" with routing_tags: ["manufacturing"]). ` +
+                `This should have been normalized upstream before reaching executeEmissions().`
+              );
+            }
+          }
+        };
+
+        // Check for legacy format in common locations
+        if (params.routing?.specialization) {
+          checkForLegacyFormat(params.routing.specialization, 'params.routing.specialization');
+        }
+        if (params.specialization) {
+          checkForLegacyFormat(params.specialization, 'params.specialization');
+        }
+        if ((emission as any).specialization) {
+          checkForLegacyFormat((emission as any).specialization, 'emission.specialization');
+        }
+        
+        // Set default specialization if missing (infer from subtask_type)
+        if (!params.routing.specialization) {
+          // Map common subtask types to specializations
+          const specializationMap: Record<string, string> = {
+            'generate_precision_mockups': 'design',
+            'manufacture_wearable': 'manufacturing',
+            'design_wearable': 'design',
+            'print_placement': 'design',
+            'fabric_selection': 'design',
+          };
+          
+          // Try to infer from subtask_type name
+          let inferredSpecialization = specializationMap[subtaskType.toLowerCase()];
+          
+          // Fallback: extract from subtask_type if it contains known patterns
+          if (!inferredSpecialization) {
+            if (subtaskType.toLowerCase().includes('design') || 
+                subtaskType.toLowerCase().includes('mockup') ||
+                subtaskType.toLowerCase().includes('render')) {
+              inferredSpecialization = 'design';
+            } else if (subtaskType.toLowerCase().includes('manufacture') ||
+                      subtaskType.toLowerCase().includes('mfg') ||
+                      subtaskType.toLowerCase().includes('production')) {
+              inferredSpecialization = 'manufacturing';
+            }
+          }
+          
+          if (inferredSpecialization) {
+            params.routing.specialization = inferredSpecialization;
+            
+            // Set required_specialization for critical subtask types
+            const requiresHardConstraint = ['generate_precision_mockups'];
+            if (requiresHardConstraint.includes(subtaskType.toLowerCase())) {
+              params.routing.required_specialization = inferredSpecialization;
+              console.error(`[executeEmissions] 🔧 Set required_specialization "${inferredSpecialization}" for subtask "${subtaskType}"`);
+            } else {
+              console.error(`[executeEmissions] 🔧 Set default specialization "${inferredSpecialization}" for subtask "${subtaskType}"`);
+            }
+          } else {
+            console.error(`[executeEmissions] ⚠️ No specialization found in params.routing for subtask "${subtaskType}"`);
+          }
+        } else {
+          // Specialization already exists - set required_specialization for critical subtask types
+          const requiresHardConstraint = ['generate_precision_mockups'];
+          if (requiresHardConstraint.includes(subtaskType.toLowerCase())) {
+            params.routing.required_specialization = params.routing.specialization;
+            console.error(`[executeEmissions] 🔧 Set required_specialization "${params.routing.specialization}" for subtask "${subtaskType}"`);
+          }
+        }
 
         // Map subtask_type to TaskType (default to "action" if unknown)
         const taskType: TaskType = 
@@ -848,19 +1085,45 @@ class SeedCoreService {
             ? subtaskType as TaskType
             : "action";
 
+        // Build final params with _emission metadata
+        const finalParams: Record<string, any> = {
+          ...params,
+          // Preserve emission metadata for provenance
+          _emission: {
+            subtask_type: subtaskType,
+            position: emission.position,
+            original_emission: emission,
+          },
+        };
+
+        // Log params BEFORE createTask to see what's being sent
+        const routingInfo = (finalParams as any).routing;
+        const specializationInfo = (finalParams as any).specialization;
+        console.error(`[executeEmissions] 📤 About to createTask for subtask "${subtaskType}":`, JSON.stringify({
+          type: taskType,
+          description,
+          domain: options?.domain || params.domain,
+          params: {
+            routing_specialization: routingInfo?.specialization,
+            routing_required_specialization: routingInfo?.required_specialization,
+            routing_tags: routingInfo?.routing_tags,
+            specialization: specializationInfo,
+            _emission: {
+              subtask_type: finalParams._emission.subtask_type,
+              position: finalParams._emission.position,
+              original_emission_specialization: finalParams._emission.original_emission?.params?.routing?.specialization || 
+                                               finalParams._emission.original_emission?.params?.specialization ||
+                                               finalParams._emission.original_emission?.specialization,
+            },
+            all_param_keys: Object.keys(finalParams),
+          },
+        }, null, 2));
+
         // Create the task
         const task = await this.createTask({
           type: taskType,
           description,
-          params: {
-            ...params,
-            // Preserve emission metadata for provenance
-            _emission: {
-              subtask_type: subtaskType,
-              position: emission.position,
-              original_emission: emission,
-            },
-          },
+          params: finalParams,
           domain: options?.domain || params.domain,
           run_immediately: options?.runImmediately !== false,
         });
